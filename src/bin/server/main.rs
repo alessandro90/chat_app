@@ -1,11 +1,16 @@
 use std::{io, net::SocketAddr};
 
 use tokio::{
-    net::{TcpListener, TcpStream},
+    net::{
+        tcp::{OwnedReadHalf, OwnedWriteHalf},
+        TcpListener, TcpStream,
+    },
     spawn,
+    sync::mpsc::{self, Receiver, Sender},
 };
 
 const MAX_MSG_BYTES: usize = 1024;
+const MAX_CHANNEL_QUEUE_LEN: usize = 256;
 
 #[tokio::main]
 async fn main() {
@@ -15,15 +20,41 @@ async fn main() {
 
     loop {
         let (socket, sock_addr) = listener.accept().await.expect("Cannot accept connection");
+        let (reader, writer) = socket.into_split();
+        let (sender, receiver) = mpsc::channel(MAX_CHANNEL_QUEUE_LEN);
         spawn(async move {
-            if let Err(e) = handle_bytes(socket, sock_addr).await {
+            if let Err(e) = handle_bytes(reader, sender, sock_addr).await {
+                eprintln!("{}", e);
+            };
+        });
+        spawn(async move {
+            if let Err(e) = send_bytes(writer, receiver).await {
                 eprintln!("{}", e);
             };
         });
     }
 }
 
-async fn handle_bytes(stream: TcpStream, sock_addr: SocketAddr) -> std::io::Result<()> {
+async fn send_bytes(stream: OwnedWriteHalf, mut receiver: Receiver<String>) -> std::io::Result<()> {
+    'main_loop: loop {
+        match receiver.recv().await {
+            Some(msg) => {
+                stream.writable().await?;
+                stream
+                    .try_write(msg.as_bytes())
+                    .expect("Cannot write to stream");
+            }
+            None => break 'main_loop,
+        }
+    }
+    Ok(())
+}
+
+async fn handle_bytes(
+    stream: OwnedReadHalf,
+    sender: Sender<String>,
+    sock_addr: SocketAddr,
+) -> std::io::Result<()> {
     println!(
         "Incoming connection. Port: {}, address: {}",
         sock_addr.port(),
@@ -39,8 +70,12 @@ async fn handle_bytes(stream: TcpStream, sock_addr: SocketAddr) -> std::io::Resu
                 break;
             }
             Ok(n) => {
-                println!("Got {} bytes from {}", n, sock_addr.port());
-                println!("{}", String::from_utf8_lossy(&buf[..n]));
+                let msg = String::from_utf8_lossy(&buf[..n]);
+                println!("{}", msg);
+                sender
+                    .send(msg.to_string())
+                    .await
+                    .expect("Cannot send reply");
             }
             // False wake
             Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
