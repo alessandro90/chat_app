@@ -1,11 +1,14 @@
-use std::{collections::HashMap, io, net::SocketAddr};
+use std::{collections::HashMap, io, net::SocketAddr, sync::Arc};
 use tokio::{
     net::{
         tcp::{OwnedReadHalf, OwnedWriteHalf},
         TcpListener,
     },
     spawn,
-    sync::mpsc::{self, Receiver, Sender},
+    sync::{
+        mpsc::{self, Receiver, Sender},
+        Mutex,
+    },
 };
 
 const MAX_MSG_BYTES: usize = 1024;
@@ -21,47 +24,54 @@ enum Connection {
 }
 
 struct Connections {
-    entries: HashMap<SocketAddr, OwnedWriteHalf>,
+    entries: Arc<Mutex<HashMap<SocketAddr, OwnedWriteHalf>>>,
 }
 
 impl Default for Connections {
     fn default() -> Self {
         Self {
-            entries: HashMap::new(),
+            entries: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 }
 
 impl Connections {
-    async fn handle_conn(&mut self, conn: Connection) {
+    async fn handle_conn(&self, conn: Connection) {
         match conn {
             Connection::Push {
                 sockaddr,
                 stream_writer,
             } => {
                 println!("added connection: {}", sockaddr);
-                let _ = self.entries.insert(sockaddr, stream_writer);
+                let _ = self.entries.lock().await.insert(sockaddr, stream_writer);
             }
             Connection::Pop(ref sockaddr) => {
                 println!("removed connection: {}", sockaddr);
-                let _ = self.entries.remove(sockaddr);
+                let _ = self.entries.lock().await.remove(sockaddr);
             }
         };
     }
 
     async fn msg_broadcast(&self, msg: String) {
-        for stream in self.entries.values() {
-            stream.writable().await.expect("Stream not writable");
-            stream
-                .try_write(msg.as_bytes())
-                .expect("Cannot write to stream");
+        for sockaddr in self.entries.lock().await.keys().cloned() {
+            let msg = msg.clone();
+            let entries = Arc::clone(&self.entries);
+            spawn(async move {
+                let entries = &entries.lock().await;
+                if let Some(stream) = entries.get(&sockaddr) {
+                    stream.writable().await.expect("Stream not writable");
+                    stream
+                        .try_write(msg.as_bytes())
+                        .expect("Cannot write to stream");
+                }
+            });
         }
     }
 }
 
 async fn connections_task(mut conn_recv: Receiver<Connection>, mut msg_recv: Receiver<String>) {
     spawn(async move {
-        let mut connections = Connections::default();
+        let connections = Connections::default();
         loop {
             tokio::select! {
                 conn = conn_recv.recv() => {
