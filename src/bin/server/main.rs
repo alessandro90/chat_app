@@ -5,7 +5,7 @@ use tokio::{
         TcpListener,
     },
     spawn,
-    sync::mpsc::{self, Sender},
+    sync::mpsc::{self, Receiver, Sender},
 };
 
 const MAX_MSG_BYTES: usize = 1024;
@@ -20,100 +20,164 @@ enum Connection {
     Pop(SocketAddr),
 }
 
-#[tokio::main]
-async fn main() {
-    let listener = TcpListener::bind("127.0.0.1:60000")
-        .await
-        .expect("No client");
+struct Connections {
+    entries: HashMap<SocketAddr, OwnedWriteHalf>,
+}
 
-    let (incomng_connetions_sender, mut incoming_connections_receiver) =
-        mpsc::channel(MAX_SIMULATANEOUS_INCOMING_CONNECTIONS);
-    let (incomng_msg_sender, mut incoming_msg_receiver) =
-        mpsc::channel::<String>(MAX_CHANNEL_QUEUE_LEN);
+impl Default for Connections {
+    fn default() -> Self {
+        Self {
+            entries: HashMap::new(),
+        }
+    }
+}
+
+impl Connections {
+    async fn handle_conn(&mut self, conn: Connection) {
+        match conn {
+            Connection::Push {
+                sockaddr,
+                stream_writer,
+            } => {
+                println!("added connection: {}", sockaddr);
+                let _ = self.entries.insert(sockaddr, stream_writer);
+            }
+            Connection::Pop(ref sockaddr) => {
+                println!("removed connection: {}", sockaddr);
+                let _ = self.entries.remove(sockaddr);
+            }
+        };
+    }
+
+    async fn msg_broadcast(&self, msg: String) {
+        for stream in self.entries.values() {
+            stream.writable().await.expect("Stream not writable");
+            stream
+                .try_write(msg.as_bytes())
+                .expect("Cannot write to stream");
+        }
+    }
+}
+
+async fn connections_task(mut conn_recv: Receiver<Connection>, mut msg_recv: Receiver<String>) {
     spawn(async move {
-        let mut connections = HashMap::new();
+        let mut connections = Connections::default();
         loop {
             tokio::select! {
-                val = incoming_connections_receiver.recv() => {
-                    if let Some(val) = val {
-                        match val {
-                            Connection::Push{sockaddr, stream_writer} => {
-                                let _ = connections.insert(sockaddr, stream_writer);
-                            },
-                            Connection::Pop(ref sockaddr) => {
-                                let _ = connections.remove(sockaddr);
-                            }
-                        };
+                conn = conn_recv.recv() => {
+                    if let Some(conn) = conn {
+                        connections.handle_conn(conn).await;
                     }
                 },
-                msg = incoming_msg_receiver.recv() => {
+                msg = msg_recv.recv() => {
                     if let Some(msg) = msg {
-                        for stream in connections.values() {
-                            stream.writable().await.expect("Stream not writable");
-                            stream
-                                .try_write(msg.as_bytes())
-                                .expect("Cannot write to stream");
-                        }
+                        connections.msg_broadcast(msg).await;
                     }
                 }
             }
         }
     });
+}
 
-    loop {
-        let (socket, sock_addr) = listener.accept().await.expect("Cannot accept connection");
-        let (stream_reader, stream_writer) = socket.into_split();
-        incomng_connetions_sender
+struct MsgHandler {
+    listener: TcpListener,
+    conn_sender: Sender<Connection>,
+    msg_sender: Sender<String>,
+}
+
+impl MsgHandler {
+    async fn new(
+        ip: &str,
+        port: u16,
+        conn_sender: Sender<Connection>,
+        msg_sender: Sender<String>,
+    ) -> Self {
+        let listener = TcpListener::bind(format!("{}:{}", ip, port))
+            .await
+            .expect("No client");
+        Self {
+            listener,
+            conn_sender,
+            msg_sender,
+        }
+    }
+
+    async fn listen_for_conn(&self) -> (OwnedReadHalf, OwnedWriteHalf, SocketAddr) {
+        let (stream, sockaddr) = self
+            .listener
+            .accept()
+            .await
+            .expect("Cannot accept connection");
+        let (reader, writer) = stream.into_split();
+        (reader, writer, sockaddr)
+    }
+
+    async fn push_conn(&self, sockaddr: SocketAddr, stream_writer: OwnedWriteHalf) {
+        self.conn_sender
             .send(Connection::Push {
-                sockaddr: sock_addr,
+                sockaddr,
                 stream_writer,
             })
             .await
             .expect("Cannot queue new connection");
-        let incomng_msg_sender_cloned = incomng_msg_sender.clone();
-        let incomng_connections_sender_cloned = incomng_connetions_sender.clone();
+    }
+
+    async fn spawn_conn_task(&self, stream_reader: OwnedReadHalf, sockaddr: SocketAddr) {
+        let msg_sender = self.msg_sender.clone();
+        let conn_sender = self.conn_sender.clone();
         spawn(async move {
-            if let Err(e) = handle_bytes(
-                stream_reader,
-                incomng_msg_sender_cloned,
-                sock_addr,
-                incomng_connections_sender_cloned,
-            )
-            .await
-            {
+            if let Err(e) = handle_bytes(stream_reader, msg_sender, sockaddr, conn_sender).await {
                 eprintln!("{}", e);
             };
         });
     }
 }
 
+async fn msg_task(
+    ip: &str,
+    port: u16,
+    conn_sender: Sender<Connection>,
+    msg_sender: Sender<String>,
+) {
+    let msg_handler = MsgHandler::new(ip, port, conn_sender, msg_sender).await;
+    loop {
+        let (stream_reader, stream_writer, sockaddr) = msg_handler.listen_for_conn().await;
+        msg_handler.push_conn(sockaddr, stream_writer).await;
+        msg_handler.spawn_conn_task(stream_reader, sockaddr).await;
+    }
+}
+
+#[tokio::main]
+async fn main() {
+    let (conn_sender, conn_recv) = mpsc::channel(MAX_SIMULATANEOUS_INCOMING_CONNECTIONS);
+    let (msg_sender, msg_recv) = mpsc::channel::<String>(MAX_CHANNEL_QUEUE_LEN);
+    spawn(connections_task(conn_recv, msg_recv));
+    msg_task("127.0.0.1", 60_000, conn_sender, msg_sender).await;
+}
+
+// TODO: make this function resturn the message or
+// if the conn got closed and handle the messages
+// outside of it
 async fn handle_bytes(
     stream: OwnedReadHalf,
     sender: Sender<String>,
-    sock_addr: SocketAddr,
-    connection_sender: Sender<Connection>,
+    sockaddr: SocketAddr,
+    conn_sender: Sender<Connection>,
 ) -> std::io::Result<()> {
-    println!(
-        "Incoming connection. Port: {}, address: {}",
-        sock_addr.port(),
-        sock_addr.ip()
-    );
-
     let mut buf = [0; MAX_MSG_BYTES];
     loop {
         stream.readable().await?;
+        // NOTE: consider using read_buf
         match stream.try_read(&mut buf) {
             Ok(0) => {
-                println!("Bye {}", sock_addr.port());
-                connection_sender
-                    .send(Connection::Pop(sock_addr))
+                conn_sender
+                    .send(Connection::Pop(sockaddr))
                     .await
                     .expect("Cannot send pop conncetion request");
                 break;
             }
             Ok(n) => {
                 let msg = String::from_utf8_lossy(&buf[..n]);
-                println!("{}", msg);
                 sender
                     .send(msg.to_string())
                     .await
