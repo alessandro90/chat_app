@@ -75,9 +75,16 @@ impl TryInto<MsgType> for u8 {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[repr(u8)]
+pub enum Cmd {
+    UserCount,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ParsedMsg {
     Num(u32),
     Text(String),
+    Command(Cmd),
 }
 
 impl ParsedMsg {
@@ -102,12 +109,16 @@ impl ParsedMsg {
                 }
                 Some(Self::Num(u32::from_be_bytes([a, b, c, d])))
             }
-            MsgType::Text => Some(Self::Text(
-                String::from_utf8_lossy(
+            MsgType::Text => {
+                let text = String::from_utf8_lossy(
                     bytes.get(SerializedMessage::size_of_len() + MsgType::size()..)?,
-                )
-                .to_string(),
-            )),
+                );
+
+                match text.as_ref().trim() {
+                    "/count" => Some(Self::Command(Cmd::UserCount)),
+                    _ => Some(Self::Text(text.to_string())),
+                }
+            }
         }
     }
 
@@ -175,6 +186,7 @@ mod message_tests {
         match parsed {
             ParsedMsg::Num(_) => assert!(false),
             ParsedMsg::Text(txt) => assert_eq!(txt, s),
+            ParsedMsg::Command(_) => assert!(false),
         };
     }
 
@@ -186,6 +198,18 @@ mod message_tests {
         match parsed {
             ParsedMsg::Num(m) => assert_eq!(n, m),
             ParsedMsg::Text(_) => assert!(false),
+            ParsedMsg::Command(_) => assert!(false),
+        };
+    }
+
+    #[test]
+    fn cmd_test() {
+        let msg = SerializedMessage::from_string("/count");
+        let parsed = ParsedMsg::from_bytes(msg.as_bytes()).unwrap();
+        match parsed {
+            ParsedMsg::Num(_) => assert!(false),
+            ParsedMsg::Text(_) => assert!(false),
+            ParsedMsg::Command(cmd) => assert_eq!(cmd, Cmd::UserCount),
         };
     }
 }
