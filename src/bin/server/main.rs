@@ -24,45 +24,48 @@ enum Connection {
 }
 
 struct Connections {
-    entries: Arc<Mutex<HashMap<SocketAddr, OwnedWriteHalf>>>,
+    // TODO: Encapsulate Arc<Mutex<OwnedWriteHalf>> in own struct
+    entries: HashMap<SocketAddr, Arc<Mutex<OwnedWriteHalf>>>,
 }
 
 impl Default for Connections {
     fn default() -> Self {
         Self {
-            entries: Arc::new(Mutex::new(HashMap::new())),
+            entries: HashMap::new(),
         }
     }
 }
 
 impl Connections {
-    async fn handle_conn(&self, conn: Connection) {
+    fn handle_conn(&mut self, conn: Connection) {
         match conn {
             Connection::Push {
                 sockaddr,
                 stream_writer,
             } => {
                 println!("added connection: {}", sockaddr);
-                let _ = self.entries.lock().await.insert(sockaddr, stream_writer);
+                let _ = self
+                    .entries
+                    .insert(sockaddr, Arc::new(Mutex::new(stream_writer)));
             }
             Connection::Pop(ref sockaddr) => {
                 println!("removed connection: {}", sockaddr);
-                let _ = self.entries.lock().await.remove(sockaddr);
+                let _ = self.entries.remove(sockaddr);
             }
         };
     }
 
-    async fn msg_broadcast(&self, msg: String) {
-        for sockaddr in self.entries.lock().await.keys().cloned() {
+    fn msg_broadcast(&self, msg: String) {
+        for stream in self.entries.values().map(Arc::downgrade) {
             let msg = msg.clone();
-            let entries = Arc::clone(&self.entries);
             spawn(async move {
-                let entries = &entries.lock().await;
-                if let Some(stream) = entries.get(&sockaddr) {
-                    stream.writable().await.expect("Stream not writable");
-                    stream
-                        .try_write(msg.as_bytes())
-                        .expect("Cannot write to stream");
+                if let Some(stream) = stream.upgrade() {
+                    let lock_stream = stream.lock().await;
+                    if let Ok(()) = lock_stream.writable().await {
+                        lock_stream
+                            .try_write(msg.as_bytes())
+                            .expect("Cannot write to stream");
+                    }
                 }
             });
         }
@@ -71,17 +74,17 @@ impl Connections {
 
 async fn connections_task(mut conn_recv: Receiver<Connection>, mut msg_recv: Receiver<String>) {
     spawn(async move {
-        let connections = Connections::default();
+        let mut connections = Connections::default();
         loop {
             tokio::select! {
                 conn = conn_recv.recv() => {
                     if let Some(conn) = conn {
-                        connections.handle_conn(conn).await;
+                        connections.handle_conn(conn);
                     }
                 },
                 msg = msg_recv.recv() => {
                     if let Some(msg) = msg {
-                        connections.msg_broadcast(msg).await;
+                        connections.msg_broadcast(msg);
                     }
                 }
             }
