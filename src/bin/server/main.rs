@@ -1,7 +1,7 @@
 use async_chat::message::{Cmd, InfoKind, ParsedMsg, SerializedMessage};
 use std::{collections::HashMap, net::SocketAddr, sync::Arc};
 use tokio::{
-    io::AsyncReadExt,
+    io::{AsyncReadExt, AsyncWriteExt},
     net::{
         tcp::{OwnedReadHalf, OwnedWriteHalf},
         TcpListener,
@@ -70,10 +70,11 @@ impl Connections {
             let user_count = self.entries.len() as u32;
             spawn(async move {
                 if let Some(stream) = stream.upgrade() {
-                    let lock_stream = stream.lock().await;
+                    let mut lock_stream = stream.lock().await;
                     if let Ok(()) = lock_stream.writable().await {
                         lock_stream
-                            .try_write(SerializedMessage::from_number(user_count).as_bytes())
+                            .write_all(SerializedMessage::from_number(user_count).as_bytes())
+                            .await
                             .expect("Cannot write to stream");
                     }
                 }
@@ -87,7 +88,7 @@ impl Connections {
             let key = key.clone();
             spawn(async move {
                 if let Some(stream) = stream.upgrade() {
-                    let lock_stream = stream.lock().await;
+                    let mut lock_stream = stream.lock().await;
                     if let Ok(()) = lock_stream.writable().await {
                         let prefix = if key == sockaddr {
                             "You".to_string()
@@ -95,7 +96,8 @@ impl Connections {
                             sockaddr.to_string()
                         };
                         lock_stream
-                            .try_write(format!("{}: {}", prefix, txt).as_bytes())
+                            .write_all(format!("{}: {}", prefix, txt).as_bytes())
+                            .await
                             .expect("Cannot write to stream");
                     }
                 }
@@ -109,7 +111,7 @@ impl Connections {
                 if let Some(stream) = self.entries.get(&sockaddr).map(Arc::downgrade) {
                     spawn(async move {
                         if let Some(stream) = stream.upgrade() {
-                            let lock_stream = stream.lock().await;
+                            let mut lock_stream = stream.lock().await;
                             if let Ok(()) = lock_stream.writable().await {
                                 let msg = format!(
                                         "{}Your message is too long. Maximum allowed lenght in bytes is {}",
@@ -117,7 +119,8 @@ impl Connections {
                                         MAX_MSG_LEN
                                     );
                                 lock_stream
-                                    .try_write(SerializedMessage::from_string(&msg).as_bytes())
+                                    .write_all(SerializedMessage::from_string(&msg).as_bytes())
+                                    .await
                                     .expect("Cannot write to stream");
                             }
                         }
@@ -127,14 +130,15 @@ impl Connections {
             InfoKind::ServerFull => {
                 if let Some(stream) = self.entries.remove(&sockaddr) {
                     spawn(async move {
-                        let stream = stream.lock().await;
+                        let mut stream = stream.lock().await;
                         if let Ok(()) = stream.writable().await {
                             let msg = format!(
                                 "{}Server has reached max number of connections {}. Refusing the connection.",
                                 SERVER_INFO_HEADER, MAX_CONNECTIONS
                             );
                             stream
-                                .try_write(SerializedMessage::from_string(&msg).as_bytes())
+                                .write_all(SerializedMessage::from_string(&msg).as_bytes())
+                                .await
                                 .expect("Cannot write to stream");
                         }
                     });
