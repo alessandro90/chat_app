@@ -1,5 +1,5 @@
-use async_chat::message::{Cmd, InfoKind, MsgType, ParsedMsg, SerializedMessage};
-use std::{collections::HashMap, io, net::SocketAddr, sync::Arc};
+use async_chat::message::{Cmd, InfoKind, ParsedMsg, SerializedMessage};
+use std::{collections::HashMap, net::SocketAddr, sync::Arc};
 use tokio::{
     io::AsyncReadExt,
     net::{
@@ -17,9 +17,10 @@ const RESERVED_MSG_LEN: usize = 512;
 const MAX_MSG_LEN: usize = 5 * 1024;
 const MAX_CHANNEL_QUEUE_LEN: usize = 256;
 const MAX_SIMULATANEOUS_INCOMING_CONNECTIONS: usize = 32;
-
 const SERVER_INFO_HEADER: &str = "SERVER.INFO: ";
 const MAX_CONNECTIONS: usize = 100;
+const SERVER_PORT: u16 = 60_000;
+const SERVER_LISTEN_IP: &str = "127.0.0.1";
 
 enum Connection {
     Push {
@@ -80,15 +81,21 @@ impl Connections {
         }
     }
 
-    fn broadcast_msg(&self, txt: String) {
-        for stream in self.entries.values().map(Arc::downgrade) {
+    fn broadcast_msg(&self, txt: String, sockaddr: SocketAddr) {
+        for (key, stream) in self.entries.iter().map(|(k, v)| (k, Arc::downgrade(v))) {
             let txt = txt.clone();
+            let key = key.clone();
             spawn(async move {
                 if let Some(stream) = stream.upgrade() {
                     let lock_stream = stream.lock().await;
                     if let Ok(()) = lock_stream.writable().await {
+                        let prefix = if key == sockaddr {
+                            "You".to_string()
+                        } else {
+                            sockaddr.to_string()
+                        };
                         lock_stream
-                            .try_write(txt.as_bytes())
+                            .try_write(format!("{}: {}", prefix, txt).as_bytes())
                             .expect("Cannot write to stream");
                     }
                 }
@@ -130,8 +137,6 @@ impl Connections {
                                 .try_write(SerializedMessage::from_string(&msg).as_bytes())
                                 .expect("Cannot write to stream");
                         }
-                        // Close the connection
-                        drop(stream);
                     });
                 }
             }
@@ -145,7 +150,7 @@ impl Connections {
             ParsedMsg::Command(cmd) => match cmd {
                 Cmd::UserCount => self.send_count_to_user(sockaddr),
             },
-            ParsedMsg::Text(txt) => self.broadcast_msg(txt),
+            ParsedMsg::Text(txt) => self.broadcast_msg(txt, sockaddr),
             ParsedMsg::Info(info_kind) => self.send_info_msg(sockaddr, info_kind),
         };
     }
@@ -253,12 +258,16 @@ struct ConnMsg {
     msg: ParsedMsg,
 }
 
-#[tokio::main]
-async fn main() {
+async fn run_server(port: u16) {
     let (conn_sender, conn_recv) = mpsc::channel(MAX_SIMULATANEOUS_INCOMING_CONNECTIONS);
     let (msg_sender, msg_recv) = mpsc::channel::<ConnMsg>(MAX_CHANNEL_QUEUE_LEN);
     spawn(connections_task(conn_recv, msg_recv));
-    msg_task("127.0.0.1", 60_000, conn_sender, msg_sender).await;
+    msg_task(SERVER_LISTEN_IP, port, conn_sender, msg_sender).await;
+}
+
+#[tokio::main]
+async fn main() {
+    run_server(SERVER_PORT).await;
 }
 
 #[derive(Debug)]
@@ -352,5 +361,94 @@ async fn parse_messages(
                 }
             },
         }
+    }
+}
+
+#[cfg(test)]
+mod server_tests {
+    use std::time::Duration;
+    use tokio::{io::AsyncWriteExt, net::TcpStream, time::sleep};
+
+    use super::*;
+
+    #[tokio::test]
+    async fn test_simple_msg() {
+        let port = 60_001;
+        spawn(run_server(port));
+        sleep(Duration::from_millis(500)).await;
+
+        let mut client = TcpStream::connect(format!("{}:{}", SERVER_LISTEN_IP, port))
+            .await
+            .expect("Cannot connect to server");
+        let msg = SerializedMessage::from_string("Hello I am a client!");
+
+        client.writable().await.unwrap();
+        client
+            .write_all(msg.as_bytes())
+            .await
+            .expect("Cannot send message");
+        let mut v = vec![];
+        client.readable().await.unwrap();
+        let read_bytes = client.read_buf(&mut v).await.expect("Cannot read bytes");
+        println!("Bytes received: {}", read_bytes);
+        print!("Message is: ");
+        println!("{}", String::from_utf8_lossy(&v));
+    }
+
+    #[tokio::test]
+    async fn test_message_too_long() {
+        let port = 60_003;
+        spawn(run_server(port));
+        sleep(Duration::from_millis(500)).await;
+
+        let mut client = TcpStream::connect(format!("{}:{}", SERVER_LISTEN_IP, port))
+            .await
+            .expect("Cannot connect to server");
+        let s = (0..MAX_MSG_LEN + 1).map(|_| 'a').collect::<String>();
+        let msg = SerializedMessage::from_string(&s);
+
+        client.writable().await.unwrap();
+        client
+            .write_all(msg.as_bytes())
+            .await
+            .expect("Cannot send message");
+        let mut v = vec![];
+        client.readable().await.unwrap();
+        let read_bytes = client.read_buf(&mut v).await.expect("Cannot read bytes");
+        println!("Bytes received: {}", read_bytes);
+        print!("Message is: ");
+        println!("{}", String::from_utf8_lossy(&v));
+    }
+
+    #[tokio::test]
+    async fn test_multi_conn() {
+        let port = 60_002;
+        spawn(run_server(port));
+        sleep(Duration::from_millis(500)).await;
+
+        spawn(async move {
+            let mut client = TcpStream::connect(format!("{}:{}", SERVER_LISTEN_IP, port))
+                .await
+                .expect("Cannot connect to server");
+            sleep(Duration::from_millis(1_000)).await;
+            let msg = SerializedMessage::from_string("Hello I am a client!");
+
+            client.writable().await.unwrap();
+            client
+                .write_all(msg.as_bytes())
+                .await
+                .expect("Cannot send message");
+        });
+        let mut client = TcpStream::connect(format!("{}:{}", SERVER_LISTEN_IP, port))
+            .await
+            .expect("Cannot connect to server");
+        sleep(Duration::from_millis(500)).await;
+
+        let mut v = vec![];
+        client.readable().await.unwrap();
+        let read_bytes = client.read_buf(&mut v).await.expect("Cannot read bytes");
+        println!("Bytes received: {}", read_bytes);
+        print!("Message is: ");
+        println!("{}", String::from_utf8_lossy(&v));
     }
 }
