@@ -1,12 +1,11 @@
 type Size = u32;
 
-// TODO: I don't need this. I need istead
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SerializedMessage(Vec<u8>);
 
 impl SerializedMessage {
     #[must_use]
-    const fn size_of_len() -> usize {
+    pub const fn size_of_len() -> usize {
         std::mem::size_of::<Size>()
     }
 
@@ -81,10 +80,19 @@ pub enum Cmd {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[repr(u8)]
+pub enum InfoKind {
+    MessageTooLong,
+    ServerFull,
+}
+
+// NOTE: Should I create 2 message types, one for the server and one for the client?
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ParsedMsg {
     Num(u32),
     Text(String),
     Command(Cmd),
+    Info(InfoKind),
 }
 
 impl ParsedMsg {
@@ -114,7 +122,7 @@ impl ParsedMsg {
                     bytes.get(SerializedMessage::size_of_len() + MsgType::size()..)?,
                 );
 
-                match text.as_ref().trim() {
+                match text.as_ref().trim_end() {
                     "/count" => Some(Self::Command(Cmd::UserCount)),
                     _ => Some(Self::Text(text.to_string())),
                 }
@@ -123,39 +131,8 @@ impl ParsedMsg {
     }
 
     #[must_use]
-    pub fn from_bytes_unchecked(bytes: &[u8]) -> Self {
-        assert!(bytes.len() >= std::mem::size_of::<Size>() + MsgType::size());
-        let msg_type: MsgType = bytes[SerializedMessage::size_of_len()]
-            .try_into()
-            .expect("Invalid msg type");
-        match msg_type {
-            MsgType::Num => {
-                assert!(
-                    bytes.len()
-                        == SerializedMessage::size_of_len()
-                            + MsgType::size()
-                            + std::mem::size_of::<u32>()
-                );
-                let mut it = bytes
-                    .iter()
-                    .skip(SerializedMessage::size_of_len() + MsgType::size());
-                // This is guaranteed by the above assert
-                let a = *unsafe { it.next().unwrap_unchecked() };
-                let b = *unsafe { it.next().unwrap_unchecked() };
-                let c = *unsafe { it.next().unwrap_unchecked() };
-                let d = *unsafe { it.next().unwrap_unchecked() };
-                Self::Num(u32::from_be_bytes([a, b, c, d]))
-            }
-            MsgType::Text => {
-                assert!(bytes.len() > SerializedMessage::size_of_len() + MsgType::size());
-                Self::Text(
-                    String::from_utf8_lossy(
-                        &bytes[SerializedMessage::size_of_len() + MsgType::size()..],
-                    )
-                    .to_string(),
-                )
-            }
-        }
+    pub fn from_info(info_kind: InfoKind) -> Self {
+        Self::Info(info_kind)
     }
 }
 
@@ -187,6 +164,7 @@ mod message_tests {
             ParsedMsg::Num(_) => assert!(false),
             ParsedMsg::Text(txt) => assert_eq!(txt, s),
             ParsedMsg::Command(_) => assert!(false),
+            ParsedMsg::Info(_) => assert!(false),
         };
     }
 
@@ -199,6 +177,7 @@ mod message_tests {
             ParsedMsg::Num(m) => assert_eq!(n, m),
             ParsedMsg::Text(_) => assert!(false),
             ParsedMsg::Command(_) => assert!(false),
+            ParsedMsg::Info(_) => assert!(false),
         };
     }
 
@@ -210,6 +189,7 @@ mod message_tests {
             ParsedMsg::Num(_) => assert!(false),
             ParsedMsg::Text(_) => assert!(false),
             ParsedMsg::Command(cmd) => assert_eq!(cmd, Cmd::UserCount),
+            ParsedMsg::Info(_) => assert!(false),
         };
     }
 }

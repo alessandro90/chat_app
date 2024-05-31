@@ -1,5 +1,7 @@
+use async_chat::message::{Cmd, InfoKind, MsgType, ParsedMsg, SerializedMessage};
 use std::{collections::HashMap, io, net::SocketAddr, sync::Arc};
 use tokio::{
+    io::AsyncReadExt,
     net::{
         tcp::{OwnedReadHalf, OwnedWriteHalf},
         TcpListener,
@@ -11,9 +13,13 @@ use tokio::{
     },
 };
 
-const MAX_MSG_BYTES: usize = 1024;
+const RESERVED_MSG_LEN: usize = 512;
+const MAX_MSG_LEN: usize = 5 * 1024;
 const MAX_CHANNEL_QUEUE_LEN: usize = 256;
 const MAX_SIMULATANEOUS_INCOMING_CONNECTIONS: usize = 32;
+
+const SERVER_INFO_HEADER: &str = "SERVER.INFO: ";
+const MAX_CONNECTIONS: usize = 100;
 
 enum Connection {
     Push {
@@ -47,6 +53,9 @@ impl Connections {
                 let _ = self
                     .entries
                     .insert(sockaddr, Arc::new(Mutex::new(stream_writer)));
+                if self.entries.len() >= MAX_CONNECTIONS {
+                    self.send_info_msg(sockaddr, InfoKind::ServerFull);
+                }
             }
             Connection::Pop(ref sockaddr) => {
                 println!("removed connection: {}", sockaddr);
@@ -55,55 +64,126 @@ impl Connections {
         };
     }
 
-    fn msg_broadcast(&self, msg: String) {
-        for stream in self.entries.values().map(Arc::downgrade) {
-            let msg = msg.clone();
+    fn send_count_to_user(&self, sockaddr: SocketAddr) {
+        if let Some(stream) = self.entries.get(&sockaddr).map(Arc::downgrade) {
+            let user_count = self.entries.len() as u32;
             spawn(async move {
                 if let Some(stream) = stream.upgrade() {
                     let lock_stream = stream.lock().await;
                     if let Ok(()) = lock_stream.writable().await {
                         lock_stream
-                            .try_write(msg.as_bytes())
+                            .try_write(SerializedMessage::from_number(user_count).as_bytes())
                             .expect("Cannot write to stream");
                     }
                 }
             });
         }
     }
-}
 
-async fn connections_task(mut conn_recv: Receiver<Connection>, mut msg_recv: Receiver<String>) {
-    spawn(async move {
-        let mut connections = Connections::default();
-        loop {
-            tokio::select! {
-                conn = conn_recv.recv() => {
-                    if let Some(conn) = conn {
-                        connections.handle_conn(conn);
+    fn broadcast_msg(&self, txt: String) {
+        for stream in self.entries.values().map(Arc::downgrade) {
+            let txt = txt.clone();
+            spawn(async move {
+                if let Some(stream) = stream.upgrade() {
+                    let lock_stream = stream.lock().await;
+                    if let Ok(()) = lock_stream.writable().await {
+                        lock_stream
+                            .try_write(txt.as_bytes())
+                            .expect("Cannot write to stream");
                     }
-                },
-                msg = msg_recv.recv() => {
-                    if let Some(msg) = msg {
-                        connections.msg_broadcast(msg);
-                    }
+                }
+            });
+        }
+    }
+
+    fn send_info_msg(&mut self, sockaddr: SocketAddr, info_kind: InfoKind) {
+        match info_kind {
+            InfoKind::MessageTooLong => {
+                if let Some(stream) = self.entries.get(&sockaddr).map(Arc::downgrade) {
+                    spawn(async move {
+                        if let Some(stream) = stream.upgrade() {
+                            let lock_stream = stream.lock().await;
+                            if let Ok(()) = lock_stream.writable().await {
+                                let msg = format!(
+                                        "{}Your message is too long. Maximum allowed lenght in bytes is {}",
+                                        SERVER_INFO_HEADER,
+                                        MAX_MSG_LEN
+                                    );
+                                lock_stream
+                                    .try_write(SerializedMessage::from_string(&msg).as_bytes())
+                                    .expect("Cannot write to stream");
+                            }
+                        }
+                    });
+                }
+            }
+            InfoKind::ServerFull => {
+                if let Some(stream) = self.entries.remove(&sockaddr) {
+                    spawn(async move {
+                        let stream = stream.lock().await;
+                        if let Ok(()) = stream.writable().await {
+                            let msg = format!(
+                                "{}Server has reached max number of connections {}. Refusing the connection.",
+                                SERVER_INFO_HEADER, MAX_CONNECTIONS
+                            );
+                            stream
+                                .try_write(SerializedMessage::from_string(&msg).as_bytes())
+                                .expect("Cannot write to stream");
+                        }
+                        // Close the connection
+                        drop(stream);
+                    });
                 }
             }
         }
-    });
+    }
+
+    fn handle_message(&mut self, conn_msg: ConnMsg) {
+        let ConnMsg { msg, sockaddr } = conn_msg;
+        match msg {
+            ParsedMsg::Num(_) => (),
+            ParsedMsg::Command(cmd) => match cmd {
+                Cmd::UserCount => self.send_count_to_user(sockaddr),
+            },
+            ParsedMsg::Text(txt) => self.broadcast_msg(txt),
+            ParsedMsg::Info(info_kind) => self.send_info_msg(sockaddr, info_kind),
+        };
+    }
 }
 
-struct MsgHandler {
+async fn connections_task(
+    mut conn_recv: Receiver<Connection>,
+    mut msg_recv: Receiver<ConnMsg>,
+) -> ! {
+    let mut connections = Connections::default();
+    loop {
+        tokio::select! {
+            conn = conn_recv.recv() => {
+                if let Some(conn) = conn {
+                    connections.handle_conn(conn);
+                }
+            },
+            msg = msg_recv.recv() => {
+                if let Some(msg) = msg {
+                    connections.handle_message(msg);
+                }
+            }
+        }
+    }
+}
+
+struct Server {
     listener: TcpListener,
     conn_sender: Sender<Connection>,
-    msg_sender: Sender<String>,
+    msg_sender: Sender<ConnMsg>,
 }
 
-impl MsgHandler {
+impl Server {
     async fn new(
         ip: &str,
         port: u16,
         conn_sender: Sender<Connection>,
-        msg_sender: Sender<String>,
+        msg_sender: Sender<ConnMsg>,
     ) -> Self {
         let listener = TcpListener::bind(format!("{}:{}", ip, port))
             .await
@@ -139,8 +219,16 @@ impl MsgHandler {
         let msg_sender = self.msg_sender.clone();
         let conn_sender = self.conn_sender.clone();
         spawn(async move {
-            if let Err(e) = handle_bytes(stream_reader, msg_sender, sockaddr, conn_sender).await {
-                eprintln!("{}", e);
+            if let Err(parse_error) = parse_messages(stream_reader, msg_sender, sockaddr).await {
+                match parse_error {
+                    ParseError::ConnClosed(conn) => {
+                        conn_sender
+                            .send(Connection::Pop(conn))
+                            .await
+                            .expect("Cannot send pop conncetion request");
+                    }
+                    e @ (ParseError::Unknown(_) | ParseError::InvalidMsg) => eprintln!("{:?}", e),
+                }
             };
         });
     }
@@ -150,9 +238,9 @@ async fn msg_task(
     ip: &str,
     port: u16,
     conn_sender: Sender<Connection>,
-    msg_sender: Sender<String>,
-) {
-    let msg_handler = MsgHandler::new(ip, port, conn_sender, msg_sender).await;
+    msg_sender: Sender<ConnMsg>,
+) -> ! {
+    let msg_handler = Server::new(ip, port, conn_sender, msg_sender).await;
     loop {
         let (stream_reader, stream_writer, sockaddr) = msg_handler.listen_for_conn().await;
         msg_handler.push_conn(sockaddr, stream_writer).await;
@@ -160,50 +248,109 @@ async fn msg_task(
     }
 }
 
+struct ConnMsg {
+    sockaddr: SocketAddr,
+    msg: ParsedMsg,
+}
+
 #[tokio::main]
 async fn main() {
     let (conn_sender, conn_recv) = mpsc::channel(MAX_SIMULATANEOUS_INCOMING_CONNECTIONS);
-    let (msg_sender, msg_recv) = mpsc::channel::<String>(MAX_CHANNEL_QUEUE_LEN);
+    let (msg_sender, msg_recv) = mpsc::channel::<ConnMsg>(MAX_CHANNEL_QUEUE_LEN);
     spawn(connections_task(conn_recv, msg_recv));
     msg_task("127.0.0.1", 60_000, conn_sender, msg_sender).await;
 }
 
-// TODO: make this function resturn the message or
-// if the conn got closed and handle the messages
-// outside of it
-async fn handle_bytes(
-    stream: OwnedReadHalf,
-    sender: Sender<String>,
+#[derive(Debug)]
+enum ParseError {
+    ConnClosed(SocketAddr),
+    InvalidMsg,
+    #[allow(dead_code)]
+    Unknown(String),
+}
+
+async fn parse_messages(
+    mut stream: OwnedReadHalf,
+    sender: Sender<ConnMsg>,
     sockaddr: SocketAddr,
-    conn_sender: Sender<Connection>,
-) -> std::io::Result<()> {
-    let mut buf = [0; MAX_MSG_BYTES];
-    loop {
-        stream.readable().await?;
-        // NOTE: consider using read_buf
-        match stream.try_read(&mut buf) {
-            Ok(0) => {
-                conn_sender
-                    .send(Connection::Pop(sockaddr))
-                    .await
-                    .expect("Cannot send pop conncetion request");
-                break;
-            }
-            Ok(n) => {
-                let msg = String::from_utf8_lossy(&buf[..n]);
-                sender
-                    .send(msg.to_string())
-                    .await
-                    .expect("Cannot send reply");
-            }
-            // False wake
-            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
-                continue;
-            }
-            Err(e) => {
-                return Err(e.into());
-            }
-        };
+) -> Result<(), ParseError> {
+    enum State {
+        ReadHeader,
+        ReadPayload,
+        DiscardMessage(usize),
     }
-    Ok(())
+    let mut state = State::ReadHeader;
+    let mut buf = Vec::with_capacity(RESERVED_MSG_LEN);
+    let mut size = 0;
+    loop {
+        stream
+            .readable()
+            .await
+            .map_err(|e| ParseError::Unknown(e.to_string()))?;
+        match state {
+            State::ReadHeader => {
+                size = stream
+                    .read_u32()
+                    .await
+                    .map_err(|e| ParseError::Unknown(e.to_string()))?;
+                let msg_type = stream
+                    .read_u8()
+                    .await
+                    .map_err(|e| ParseError::Unknown(e.to_string()))?;
+                if size > MAX_MSG_LEN as u32 {
+                    sender
+                        .send(ConnMsg {
+                            sockaddr,
+                            msg: ParsedMsg::from_info(InfoKind::MessageTooLong),
+                        })
+                        .await
+                        .expect("Cannot send reply");
+                    state = State::DiscardMessage(size as usize - 5);
+                    buf.resize(256, 0);
+                } else if size > SerializedMessage::size_of_len() as u32 + 1 {
+                    size.to_be_bytes().into_iter().for_each(|b| buf.push(b));
+                    buf.push(msg_type);
+                    buf.resize(size as usize, 0);
+                    state = State::ReadPayload;
+                }
+            }
+            State::ReadPayload => match stream.read_exact(&mut buf[5..]).await {
+                Ok(_) => {
+                    let msg = ParsedMsg::from_bytes(&buf[..size as usize])
+                        .ok_or_else(|| ParseError::InvalidMsg)?;
+                    if let ParsedMsg::Info(i) = &msg {
+                        println!(
+                            "Invalid message of type INFO from client: {:?}. Ignoring.",
+                            i
+                        );
+                    } else {
+                        buf.clear();
+                        size = 0;
+                        state = State::ReadHeader;
+                        sender
+                            .send(ConnMsg { sockaddr, msg })
+                            .await
+                            .expect("Cannot send reply");
+                    }
+                }
+                Err(_) => {
+                    return Err(ParseError::ConnClosed(sockaddr));
+                }
+            },
+            State::DiscardMessage(to_discard) => match stream.read_exact(&mut buf).await {
+                Ok(bytes) => {
+                    if bytes == to_discard {
+                        buf.clear();
+                        size = 0;
+                        state = State::ReadHeader;
+                    } else {
+                        state = State::DiscardMessage(to_discard - bytes);
+                    }
+                }
+                Err(_) => {
+                    return Err(ParseError::ConnClosed(sockaddr));
+                }
+            },
+        }
+    }
 }
