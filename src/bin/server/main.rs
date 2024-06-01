@@ -44,7 +44,7 @@ impl Default for Connections {
 }
 
 impl Connections {
-    fn handle_conn(&mut self, conn: Connection) {
+    async fn handle_conn(&mut self, conn: Connection) {
         match conn {
             Connection::Push {
                 sockaddr,
@@ -58,9 +58,15 @@ impl Connections {
                     self.send_info_msg(sockaddr, InfoKind::ServerFull);
                 }
             }
-            Connection::Pop(ref sockaddr) => {
+            Connection::Pop(sockaddr) => {
                 println!("removed connection: {}", sockaddr);
-                let _ = self.entries.remove(sockaddr);
+                let stream = self.entries.remove(&sockaddr);
+                if let Some(stream) = stream {
+                    let mut stream = stream.lock().await;
+                    if let Err(e) = stream.shutdown().await {
+                        println!("Cannot shutdown stream: {}", e);
+                    }
+                }
             }
         };
     }
@@ -150,7 +156,7 @@ impl Connections {
     fn handle_message(&mut self, conn_msg: ConnMsg) {
         let ConnMsg { msg, sockaddr } = conn_msg;
         match msg {
-            ParsedMsg::Num(_) => (),
+            ParsedMsg::Num(_) => (), // Clients cannot send numbers
             ParsedMsg::Command(cmd) => match cmd {
                 Cmd::UserCount => self.send_count_to_user(sockaddr),
             },
@@ -169,7 +175,7 @@ async fn connections_task(
         tokio::select! {
             conn = conn_recv.recv() => {
                 if let Some(conn) = conn {
-                    connections.handle_conn(conn);
+                    connections.handle_conn(conn).await;
                 }
             },
             msg = msg_recv.recv() => {
@@ -236,7 +242,7 @@ impl Server {
                             .await
                             .expect("Cannot send pop conncetion request");
                     }
-                    e @ (ParseError::Unknown(_) | ParseError::InvalidMsg) => eprintln!("{:?}", e),
+                    ParseError::InvalidMsg => eprintln!("Invalid Msg: {:?}", parse_error),
                 }
             };
         });
@@ -278,8 +284,21 @@ async fn main() {
 enum ParseError {
     ConnClosed(SocketAddr),
     InvalidMsg,
-    #[allow(dead_code)]
-    Unknown(String),
+}
+
+macro_rules! or_close {
+    ($stream:expr, $sockaddr:expr, $method:ident) => {
+        $stream
+            .$method()
+            .await
+            .map_err(|_| ParseError::ConnClosed($sockaddr))
+    };
+    ($stream:expr, $sockaddr:expr, $method:ident, $arg:expr) => {
+        $stream
+            .$method($arg)
+            .await
+            .map_err(|_| ParseError::ConnClosed($sockaddr))
+    };
 }
 
 async fn parse_messages(
@@ -296,20 +315,11 @@ async fn parse_messages(
     let mut buf = Vec::with_capacity(RESERVED_MSG_LEN);
     let mut size = 0;
     loop {
-        stream
-            .readable()
-            .await
-            .map_err(|e| ParseError::Unknown(e.to_string()))?;
+        or_close!(stream, sockaddr, readable)?;
         match state {
             State::ReadHeader => {
-                size = stream
-                    .read_u32()
-                    .await
-                    .map_err(|e| ParseError::Unknown(e.to_string()))?;
-                let msg_type = stream
-                    .read_u8()
-                    .await
-                    .map_err(|e| ParseError::Unknown(e.to_string()))?;
+                size = or_close!(stream, sockaddr, read_u32)?;
+                let msg_type = or_close!(stream, sockaddr, read_u8)?;
                 if size > MAX_MSG_LEN as u32 {
                     sender
                         .send(ConnMsg {
@@ -318,38 +328,45 @@ async fn parse_messages(
                         })
                         .await
                         .expect("Cannot send reply");
-                    state = State::DiscardMessage(size as usize - 5);
+                    state =
+                        State::DiscardMessage(size as usize - SerializedMessage::size_of_header());
                     buf.resize(256, 0);
-                } else if size > SerializedMessage::size_of_len() as u32 + 1 {
+                } else if size <= SerializedMessage::size_of_header() as u32 {
+                    // This message is malformed for some reason
+                    buf.clear();
+                    size = 0;
+                    state = State::ReadHeader;
+                } else {
                     size.to_be_bytes().into_iter().for_each(|b| buf.push(b));
                     buf.push(msg_type);
                     buf.resize(size as usize, 0);
                     state = State::ReadPayload;
                 }
             }
-            State::ReadPayload => match stream.read_exact(&mut buf[5..]).await {
-                Ok(_) => {
-                    let msg = ParsedMsg::from_bytes(&buf[..size as usize])
-                        .ok_or_else(|| ParseError::InvalidMsg)?;
-                    if let ParsedMsg::Info(i) = &msg {
-                        println!(
-                            "Invalid message of type INFO from client: {:?}. Ignoring.",
-                            i
-                        );
-                    } else {
-                        buf.clear();
-                        size = 0;
-                        state = State::ReadHeader;
-                        sender
-                            .send(ConnMsg { sockaddr, msg })
-                            .await
-                            .expect("Cannot send reply");
-                    }
+            State::ReadPayload => {
+                let _ = or_close!(
+                    stream,
+                    sockaddr,
+                    read_exact,
+                    &mut buf[SerializedMessage::size_of_header()..]
+                )?;
+                let msg = ParsedMsg::from_bytes(&buf[..size as usize])
+                    .ok_or_else(|| ParseError::InvalidMsg)?;
+                if let ParsedMsg::Info(ref i) = msg {
+                    println!(
+                        "Invalid message of type INFO from client: {:?}. Ignoring.",
+                        i
+                    );
+                } else {
+                    buf.clear();
+                    size = 0;
+                    state = State::ReadHeader;
+                    sender
+                        .send(ConnMsg { sockaddr, msg })
+                        .await
+                        .expect("Cannot send reply");
                 }
-                Err(_) => {
-                    return Err(ParseError::ConnClosed(sockaddr));
-                }
-            },
+            }
             State::DiscardMessage(to_discard) => match stream.read_exact(&mut buf).await {
                 Ok(bytes) => {
                     if bytes == to_discard {
@@ -373,6 +390,8 @@ mod server_tests {
     use std::time::Duration;
     use tokio::{io::AsyncWriteExt, net::TcpStream, time::sleep};
 
+    const SERVER_IP: &str = "127.0.0.1";
+
     use super::*;
 
     #[tokio::test]
@@ -381,7 +400,7 @@ mod server_tests {
         spawn(run_server(port));
         sleep(Duration::from_millis(500)).await;
 
-        let mut client = TcpStream::connect(format!("{}:{}", SERVER_LISTEN_IP, port))
+        let mut client = TcpStream::connect(format!("{}:{}", SERVER_IP, port))
             .await
             .expect("Cannot connect to server");
         let msg = SerializedMessage::from_string("Hello I am a client!");
@@ -405,7 +424,7 @@ mod server_tests {
         spawn(run_server(port));
         sleep(Duration::from_millis(500)).await;
 
-        let mut client = TcpStream::connect(format!("{}:{}", SERVER_LISTEN_IP, port))
+        let mut client = TcpStream::connect(format!("{}:{}", SERVER_IP, port))
             .await
             .expect("Cannot connect to server");
         let s = (0..MAX_MSG_LEN + 1).map(|_| 'a').collect::<String>();
@@ -431,10 +450,10 @@ mod server_tests {
         sleep(Duration::from_millis(500)).await;
 
         spawn(async move {
-            let mut client = TcpStream::connect(format!("{}:{}", SERVER_LISTEN_IP, port))
+            let mut client = TcpStream::connect(format!("{}:{}", SERVER_IP, port))
                 .await
                 .expect("Cannot connect to server");
-            sleep(Duration::from_millis(1_000)).await;
+            sleep(Duration::from_millis(1000)).await;
             let msg = SerializedMessage::from_string("Hello I am a client!");
 
             client.writable().await.unwrap();
@@ -443,16 +462,43 @@ mod server_tests {
                 .await
                 .expect("Cannot send message");
         });
-        let mut client = TcpStream::connect(format!("{}:{}", SERVER_LISTEN_IP, port))
+        let mut client = TcpStream::connect(format!("{}:{}", SERVER_IP, port))
             .await
             .expect("Cannot connect to server");
-        sleep(Duration::from_millis(500)).await;
 
         let mut v = vec![];
         client.readable().await.unwrap();
+        println!("Readable");
         let read_bytes = client.read_buf(&mut v).await.expect("Cannot read bytes");
         println!("Bytes received: {}", read_bytes);
         print!("Message is: ");
         println!("{}", String::from_utf8_lossy(&v));
+    }
+
+    #[tokio::test]
+    async fn test_ask_count() {
+        let port = 60_004;
+        spawn(run_server(port));
+        sleep(Duration::from_millis(500)).await;
+
+        let mut client = TcpStream::connect(format!("{}:{}", SERVER_IP, port))
+            .await
+            .expect("Cannot connect to server");
+        let msg = SerializedMessage::from_string("/count");
+
+        client.writable().await.unwrap();
+        client
+            .write_all(msg.as_bytes())
+            .await
+            .expect("Cannot send message");
+        let mut v = vec![];
+        client.readable().await.unwrap();
+        let read_bytes = client.read_buf(&mut v).await.expect("Cannot read bytes");
+        println!("Bytes received: {}", read_bytes);
+        let msg = ParsedMsg::from_bytes(&v).expect("Fail to parse message");
+        let ParsedMsg::Num(n) = msg else {
+            panic!("Invalid msg");
+        };
+        assert_eq!(1, n);
     }
 }

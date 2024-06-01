@@ -10,8 +10,13 @@ impl SerializedMessage {
     }
 
     #[must_use]
+    pub const fn size_of_header() -> usize {
+        Self::size_of_len() + MsgType::size()
+    }
+
+    #[must_use]
     pub fn from_string(payload: &str) -> Self {
-        let size = (Self::size_of_len() + MsgType::size() + payload.len()) as u32;
+        let size = (Self::size_of_header() + payload.len()) as u32;
         let msg_type = MsgType::Text;
         Self(serialize(
             size,
@@ -22,9 +27,9 @@ impl SerializedMessage {
 
     #[must_use]
     pub fn from_number(n: u32) -> Self {
-        let size = (Self::size_of_len() + MsgType::size() + std::mem::size_of_val(&n)) as u32;
+        let size = (Self::size_of_header() + std::mem::size_of_val(&n)) as u32;
         let msg_type = MsgType::Num;
-        Self(serialize(size, msg_type, u32_to_bytes_iter(n.to_be())))
+        Self(serialize(size, msg_type, n.to_be_bytes().into_iter()))
     }
 
     #[must_use]
@@ -41,8 +46,8 @@ impl From<SerializedMessage> for Vec<u8> {
 
 #[must_use]
 fn serialize(size: u32, msg_type: MsgType, payload: impl Iterator<Item = u8>) -> Vec<u8> {
-    let size = size.to_be();
-    u32_to_bytes_iter(size)
+    size.to_be_bytes()
+        .into_iter()
         .chain([msg_type as u8].into_iter())
         .chain(payload)
         .collect()
@@ -105,9 +110,7 @@ impl ParsedMsg {
             .ok()?;
         match msg_type {
             MsgType::Num => {
-                let mut it = bytes
-                    .iter()
-                    .skip(SerializedMessage::size_of_len() + MsgType::size());
+                let mut it = bytes.iter().skip(SerializedMessage::size_of_header());
                 let a = *it.next()?;
                 let b = *it.next()?;
                 let c = *it.next()?;
@@ -118,9 +121,8 @@ impl ParsedMsg {
                 Some(Self::Num(u32::from_be_bytes([a, b, c, d])))
             }
             MsgType::Text => {
-                let text = String::from_utf8_lossy(
-                    bytes.get(SerializedMessage::size_of_len() + MsgType::size()..)?,
-                );
+                let text =
+                    String::from_utf8_lossy(bytes.get(SerializedMessage::size_of_header()..)?);
 
                 match text.as_ref().trim_end() {
                     "/count" => Some(Self::Command(Cmd::UserCount)),
@@ -136,24 +138,9 @@ impl ParsedMsg {
     }
 }
 
-#[must_use]
-fn u32_to_bytes_iter(n: u32) -> impl Iterator<Item = u8> {
-    (0..std::mem::size_of_val(&n)).map(move |i| ((n >> (i * 8)) & 0xFF) as u8)
-}
-
 #[cfg(test)]
 mod message_tests {
     use super::*;
-
-    #[test]
-    fn num_to_bytes_test() {
-        let x = 112u32;
-        let v: Vec<_> = u32_to_bytes_iter(x).collect();
-        assert_eq!(v[0] as u32, x & 0xFF);
-        assert_eq!(v[1] as u32, (x >> (1 * 8)) & 0xFF);
-        assert_eq!(v[2] as u32, (x >> (2 * 8)) & 0xFF);
-        assert_eq!(v[3] as u32, (x >> (3 * 8)) & 0xFF);
-    }
 
     #[test]
     fn text_test() {
