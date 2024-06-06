@@ -12,8 +12,8 @@ const CHAT_VIEW_NAME: &str = "chat_view";
 const INPUT_NAME: &str = "input_view";
 
 pub fn run() {
-    // need Arc<Mutex> here
-    // let stream = TcpStream::connect("127.0.0.1:60000").expect("Unable to connect to server");
+    // TODO: to listen to incoming messages we can make a global callback on the refresh event with
+    // on_global_callback
     let mut siv = cursive::default();
     siv.set_theme(Theme::terminal_default());
     siv.add_global_callback(Key::Esc, |s| s.quit());

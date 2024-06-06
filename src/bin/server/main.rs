@@ -1,4 +1,4 @@
-use async_chat::message::{Cmd, InfoKind, ParsedMsg, SerializedMessage};
+use async_chat::message::{Cmd, InfoKind, ParsedMsg, SerializedMessage, MAX_MSG_LEN};
 use std::{collections::HashMap, net::SocketAddr, sync::Arc};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -14,7 +14,6 @@ use tokio::{
 };
 
 const RESERVED_MSG_LEN: usize = 512;
-const MAX_MSG_LEN: usize = 5 * 1024;
 const MAX_CHANNEL_QUEUE_LEN: usize = 256;
 const MAX_SIMULATANEOUS_INCOMING_CONNECTIONS: usize = 32;
 const SERVER_INFO_HEADER: &str = "SERVER.INFO: ";

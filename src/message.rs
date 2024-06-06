@@ -1,5 +1,7 @@
 type Size = u32;
 
+pub const MAX_MSG_LEN: usize = 5 * 1024;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SerializedMessage(Vec<u8>);
 
