@@ -1,3 +1,5 @@
 mod connection;
 mod ui;
-fn main() {}
+fn main() {
+    ui::run();
+}

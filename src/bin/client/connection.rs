@@ -32,10 +32,13 @@ impl Connection {
                         let _ = stream.read_exact(&mut buf)?;
                         let size = u32::from_be_bytes(buf);
                         if size <= SerializedMessage::size_of_len() as u32 {
+                            println!("Invalid len");
                             break;
                         }
                         payload.resize(size as usize, 0);
-                        size.to_be_bytes().into_iter().for_each(|b| payload.push(b));
+                        buf.into_iter()
+                            .enumerate()
+                            .for_each(|(i, b)| payload[i] = b);
                         state = State::ReadPayload;
                     }
                     State::ReadPayload => {
@@ -67,11 +70,23 @@ impl Connection {
     }
 
     #[must_use]
-    pub fn try_read_msg(&self) -> Result<ParsedMsg, RecvTimeoutError> {
-        self.msg_receiver
-            .recv_timeout(time::Duration::from_millis(0))
+    pub fn split(self) -> (Writer, Reader) {
+        (
+            Writer {
+                stream: self.stream,
+            },
+            Reader {
+                msg_receiver: self.msg_receiver,
+            },
+        )
     }
+}
 
+pub struct Writer {
+    stream: TcpStream,
+}
+
+impl Writer {
     // TODO: use a channel to queue several messages
     #[must_use]
     pub fn try_send_msg(&mut self, msg: &str) -> io::Result<()> {
@@ -83,5 +98,17 @@ impl Connection {
         }
         self.stream
             .write_all(SerializedMessage::from_string(msg).as_bytes())
+    }
+}
+
+pub struct Reader {
+    msg_receiver: Receiver<ParsedMsg>,
+}
+
+impl Reader {
+    #[must_use]
+    pub fn try_read_msg(&self) -> Result<ParsedMsg, RecvTimeoutError> {
+        self.msg_receiver
+            .recv_timeout(time::Duration::from_millis(0))
     }
 }

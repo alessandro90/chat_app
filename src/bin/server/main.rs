@@ -101,7 +101,10 @@ impl Connections {
                             sockaddr.to_string()
                         };
                         lock_stream
-                            .write_all(format!("{}: {}", prefix, txt).as_bytes())
+                            .write_all(
+                                SerializedMessage::from_string(&format!("{}: {}", prefix, txt))
+                                    .as_bytes(),
+                            )
                             .await
                             .expect("Cannot write to stream");
                     }
