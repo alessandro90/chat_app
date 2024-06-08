@@ -75,10 +75,11 @@ impl Chat {
         }
     }
 
+    // TODO: change return type to communicate end of connection
     #[must_use]
     fn check_messages(&mut self) -> bool {
-        if let Ok(msg) = self.reader.try_read_msg() {
-            match msg {
+        match self.reader.try_read_msg() {
+            Ok(msg) => match msg {
                 ParsedMsg::Command(_) | ParsedMsg::Info(_) => false,
                 ParsedMsg::Num(n) => {
                     self.text_view.append(n.to_string());
@@ -90,9 +91,9 @@ impl Chat {
                     self.text_view.append("\n\n");
                     true
                 }
-            }
-        } else {
-            false
+            },
+            // TODO: notify end of connection
+            Err(_) => true,
         }
     }
 }
@@ -136,17 +137,14 @@ impl ViewWrapper for Input {
         match ch {
             Event::CtrlChar('s') => {
                 let content = self.text_area.get_content();
-                match self.writer.try_send_msg(content) {
-                    Ok(_) => {}
-                    Err(e) => {
-                        if e.kind() == ErrorKind::Other {
-                            println!("Other");
-                            // TODO: ask server to give max len?
-                            // or just write directly. Need a ref to TextView
-                        } else {
-                            println!("Error");
-                            // TODO: could not send message (probably server disconnected)
-                        }
+                if let Err(e) = self.writer.try_send_msg(content) {
+                    if e.kind() == ErrorKind::Other {
+                        println!("Other");
+                        // TODO: ask server to give max len?
+                        // or just write directly. Need a ref to TextView
+                    } else {
+                        println!("Error");
+                        // TODO: could not send message (probably server disconnected)
                     }
                 };
                 self.text_area.set_content("");

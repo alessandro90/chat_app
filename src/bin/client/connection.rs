@@ -2,14 +2,14 @@ use async_chat::message::{ParsedMsg, SerializedMessage, MAX_MSG_LEN};
 use std::{
     io::{self, ErrorKind, Read, Write},
     net::TcpStream,
-    sync::mpsc::{channel, Receiver, RecvTimeoutError},
+    sync::mpsc::{channel, Receiver},
     thread::spawn,
-    time,
+    time::Duration,
 };
 
 pub struct Connection {
     stream: TcpStream,
-    msg_receiver: Receiver<ParsedMsg>,
+    msg_receiver: Receiver<io::Result<ParsedMsg>>,
 }
 
 impl Connection {
@@ -17,24 +17,27 @@ impl Connection {
     pub fn new(ip: &str, port: u16) -> io::Result<Self> {
         let (msg_sender, msg_receiver) = channel();
         let mut stream = TcpStream::connect(format!("{}:{}", ip, port))?;
+        stream
+            .set_write_timeout(Some(Duration::from_millis(100)))
+            .unwrap();
         let stream_clone = stream.try_clone()?;
         enum State {
             ReadHeader,
             ReadPayload,
         }
-        spawn(move || -> io::Result<()> {
+        spawn(move || {
             let mut state = State::ReadHeader;
             let mut payload = vec![0; 256];
             loop {
                 match state {
                     State::ReadHeader => {
                         let mut buf = [0; SerializedMessage::size_of_len()];
-                        let _ = stream.read_exact(&mut buf)?;
-                        let size = u32::from_be_bytes(buf);
-                        if size <= SerializedMessage::size_of_len() as u32 {
-                            println!("Invalid len");
+                        if let Err(e) = stream.read_exact(&mut buf) {
+                            if let Err(_) = msg_sender.send(Err(e)) {}
                             break;
                         }
+                        let size = u32::from_be_bytes(buf);
+                        assert!(size <= SerializedMessage::size_of_len() as u32);
                         payload.resize(size as usize, 0);
                         buf.into_iter()
                             .enumerate()
@@ -43,14 +46,21 @@ impl Connection {
                     }
                     State::ReadPayload => {
                         // The message type
-                        let _ = stream.read_exact(
+                        if let Err(e) = stream.read_exact(
                             &mut payload[SerializedMessage::size_of_len()
                                 ..SerializedMessage::size_of_header()],
-                        )?;
-                        let _ = stream
-                            .read_exact(&mut payload[SerializedMessage::size_of_header()..])?;
+                        ) {
+                            if let Err(_) = msg_sender.send(Err(e)) {}
+                            break;
+                        }
+                        if let Err(e) =
+                            stream.read_exact(&mut payload[SerializedMessage::size_of_header()..])
+                        {
+                            if let Err(_) = msg_sender.send(Err(e)) {}
+                            break;
+                        }
                         if let Some(msg) = ParsedMsg::from_bytes(&payload) {
-                            if let Err(_) = msg_sender.send(msg) {
+                            if let Err(_) = msg_sender.send(Ok(msg)) {
                                 break;
                             }
                             state = State::ReadHeader;
@@ -61,7 +71,6 @@ impl Connection {
                     }
                 };
             }
-            Ok(())
         });
         Ok(Self {
             stream: stream_clone,
@@ -97,18 +106,24 @@ impl Writer {
             ));
         }
         self.stream
-            .write_all(SerializedMessage::from_string(msg).as_bytes())
+            .write_all(SerializedMessage::from_string(msg).as_bytes())?;
+        self.stream.flush()
     }
 }
 
 pub struct Reader {
-    msg_receiver: Receiver<ParsedMsg>,
+    msg_receiver: Receiver<io::Result<ParsedMsg>>,
 }
 
 impl Reader {
     #[must_use]
-    pub fn try_read_msg(&self) -> Result<ParsedMsg, RecvTimeoutError> {
-        self.msg_receiver
-            .recv_timeout(time::Duration::from_millis(0))
+    pub fn try_read_msg(&self) -> io::Result<ParsedMsg> {
+        match self.msg_receiver.recv_timeout(Duration::from_millis(0)) {
+            Ok(msg) => msg,
+            Err(_) => Err(io::Error::new(
+                ErrorKind::Other,
+                "Cannot recv message from thread",
+            )),
+        }
     }
 }
