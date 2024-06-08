@@ -21,6 +21,7 @@ impl Connection {
             .set_write_timeout(Some(Duration::from_millis(100)))
             .unwrap();
         let stream_clone = stream.try_clone()?;
+        // TODO: this state is not needed. Just read the message and restart
         enum State {
             ReadHeader,
             ReadPayload,
@@ -37,7 +38,7 @@ impl Connection {
                             break;
                         }
                         let size = u32::from_be_bytes(buf);
-                        assert!(size <= SerializedMessage::size_of_len() as u32);
+                        assert!(size > SerializedMessage::size_of_len() as u32);
                         payload.resize(size as usize, 0);
                         buf.into_iter()
                             .enumerate()
@@ -117,13 +118,10 @@ pub struct Reader {
 
 impl Reader {
     #[must_use]
-    pub fn try_read_msg(&self) -> io::Result<ParsedMsg> {
+    pub fn try_read_msg(&self) -> Option<io::Result<ParsedMsg>> {
         match self.msg_receiver.recv_timeout(Duration::from_millis(0)) {
-            Ok(msg) => msg,
-            Err(_) => Err(io::Error::new(
-                ErrorKind::Other,
-                "Cannot recv message from thread",
-            )),
+            Ok(msg) => Some(msg),
+            Err(_) => None,
         }
     }
 }
