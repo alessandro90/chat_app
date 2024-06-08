@@ -21,55 +21,42 @@ impl Connection {
             .set_write_timeout(Some(Duration::from_millis(100)))
             .unwrap();
         let stream_clone = stream.try_clone()?;
-        // TODO: this state is not needed. Just read the message and restart
-        enum State {
-            ReadHeader,
-            ReadPayload,
-        }
         spawn(move || {
-            let mut state = State::ReadHeader;
             let mut payload = vec![0; 256];
             loop {
-                match state {
-                    State::ReadHeader => {
-                        let mut buf = [0; SerializedMessage::size_of_len()];
-                        if let Err(e) = stream.read_exact(&mut buf) {
-                            if let Err(_) = msg_sender.send(Err(e)) {}
-                            break;
-                        }
-                        let size = u32::from_be_bytes(buf);
-                        assert!(size > SerializedMessage::size_of_len() as u32);
-                        payload.resize(size as usize, 0);
-                        buf.into_iter()
-                            .enumerate()
-                            .for_each(|(i, b)| payload[i] = b);
-                        state = State::ReadPayload;
+                let mut buf = [0; SerializedMessage::size_of_len()];
+                if let Err(e) = stream.read_exact(&mut buf) {
+                    if let Err(_) = msg_sender.send(Err(e)) {}
+                    break;
+                }
+                let size = u32::from_be_bytes(buf);
+                assert!(size > SerializedMessage::size_of_len() as u32);
+                payload.resize(size as usize, 0);
+                buf.into_iter()
+                    .enumerate()
+                    .for_each(|(i, b)| payload[i] = b);
+
+                // The message type
+                if let Err(e) = stream.read_exact(
+                    &mut payload
+                        [SerializedMessage::size_of_len()..SerializedMessage::size_of_header()],
+                ) {
+                    if let Err(_) = msg_sender.send(Err(e)) {}
+                    break;
+                }
+                if let Err(e) =
+                    stream.read_exact(&mut payload[SerializedMessage::size_of_header()..])
+                {
+                    if let Err(_) = msg_sender.send(Err(e)) {}
+                    break;
+                }
+                if let Some(msg) = ParsedMsg::from_bytes(&payload) {
+                    if let Err(_) = msg_sender.send(Ok(msg)) {
+                        break;
                     }
-                    State::ReadPayload => {
-                        // The message type
-                        if let Err(e) = stream.read_exact(
-                            &mut payload[SerializedMessage::size_of_len()
-                                ..SerializedMessage::size_of_header()],
-                        ) {
-                            if let Err(_) = msg_sender.send(Err(e)) {}
-                            break;
-                        }
-                        if let Err(e) =
-                            stream.read_exact(&mut payload[SerializedMessage::size_of_header()..])
-                        {
-                            if let Err(_) = msg_sender.send(Err(e)) {}
-                            break;
-                        }
-                        if let Some(msg) = ParsedMsg::from_bytes(&payload) {
-                            if let Err(_) = msg_sender.send(Ok(msg)) {
-                                break;
-                            }
-                            state = State::ReadHeader;
-                            payload.clear();
-                        } else {
-                            break;
-                        }
-                    }
+                    payload.clear();
+                } else {
+                    break;
                 };
             }
         });
