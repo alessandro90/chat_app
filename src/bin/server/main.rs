@@ -335,6 +335,7 @@ async fn parse_messages(
                     buf.resize(256, 0);
                 } else if size <= SerializedMessage::size_of_header() as u32 {
                     // This message is malformed for some reason
+                    // TODO: log it
                     buf.clear();
                     size = 0;
                     state = State::ReadHeader;

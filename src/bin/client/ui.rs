@@ -1,8 +1,9 @@
 use std::cell::RefCell;
 use std::env::{self};
 use std::error::Error;
-use std::io::{ErrorKind, Write};
+use std::io::ErrorKind;
 use std::rc::Rc;
+use std::time::{Duration, Instant};
 
 use async_chat::message::ParsedMsg;
 use cursive::event::{Event, EventResult};
@@ -21,6 +22,7 @@ use crate::connection::{Connection, Reader, Writer};
 const CHAT_NAME: &str = "chat_view";
 const INPUT_NAME: &str = "input_view";
 const DIALOG_NAME: &str = "ConnErr";
+const MAX_DURATION_DISCONNECTED: Duration = Duration::from_secs(5);
 
 type Runner = CursiveRunner<CursiveRunnable>;
 
@@ -51,6 +53,7 @@ struct App {
     port: u16,
     retry_requested: Rc<RefCell<bool>>,
     retries: usize,
+    time_since_disconnection: Instant,
 }
 
 impl App {
@@ -63,6 +66,7 @@ impl App {
                     port,
                     retry_requested: Rc::new(RefCell::new(false)),
                     retries: 0,
+                    time_since_disconnection: Instant::now(),
                 };
                 Self::chat_layer(siv, connection, None, None);
                 app
@@ -74,6 +78,7 @@ impl App {
                     port,
                     retry_requested: Rc::new(RefCell::new(false)),
                     retries: 1,
+                    time_since_disconnection: Instant::now(),
                 };
                 app.dialog_layer(siv);
                 app
@@ -94,6 +99,7 @@ impl App {
                         }
                         MessageAction::LostConnection => {
                             self.state = State::NotConnected;
+                            self.time_since_disconnection = Instant::now();
                             self.dialog_layer(siv);
                             siv.refresh();
                         }
@@ -101,10 +107,13 @@ impl App {
                 }
             }
             State::NotConnected => {
-                if !(*self.retry_requested).borrow().to_owned() {
+                if !(*self.retry_requested).borrow().to_owned()
+                    && Instant::now() - self.time_since_disconnection < MAX_DURATION_DISCONNECTED
+                {
                     return;
                 }
                 *self.retry_requested.borrow_mut() = false;
+                self.time_since_disconnection = Instant::now();
                 match Connection::new(&self.ip, self.port) {
                     Ok(connection) => {
                         self.state = State::Connected;
