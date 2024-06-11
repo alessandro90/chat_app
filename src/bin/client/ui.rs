@@ -23,6 +23,7 @@ const CHAT_NAME: &str = "chat_view";
 const INPUT_NAME: &str = "input_view";
 const DIALOG_NAME: &str = "conn_err_dialog";
 const MAX_DURATION_DISCONNECTED: Duration = Duration::from_secs(5);
+const MAX_CHAT_LEN_CHARS: usize = 1_024 * 50;
 
 type Runner = CursiveRunner<CursiveRunnable>;
 
@@ -230,6 +231,12 @@ impl Chat {
                 Ok(ParsedMsg::Num(n)) => {
                     self.text_view.append(n.to_string());
                     self.text_view.append("\n\n");
+                    let chars = self.text_view.get_content();
+                    let chars = chars.source();
+                    if chars.len() > MAX_CHAT_LEN_CHARS {
+                        self.text_view
+                            .set_content(chars[chars.len() / 2..].to_string());
+                    }
                     Some(MessageAction::Refresh)
                 }
                 Ok(ParsedMsg::Text(text)) => {
