@@ -19,7 +19,7 @@ const MAX_SIMULATANEOUS_INCOMING_CONNECTIONS: usize = 32;
 const SERVER_INFO_HEADER: &str = "SERVER.INFO: ";
 const MAX_CONNECTIONS: usize = 100;
 const SERVER_PORT: u16 = 60_000;
-const SERVER_LISTEN_IP: &str = "127.0.0.1";
+const SERVER_LISTEN_IP: &str = "0.0.0.0";
 const READ_TIMEOUT_MS: Duration = Duration::from_millis(1_000);
 
 const HELP_STRING: &str = r"1. /help -> Get this message
