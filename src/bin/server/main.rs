@@ -1,5 +1,5 @@
 use async_chat::message::{Cmd, InfoKind, ParsedMsg, SerializedMessage, MAX_MSG_LEN};
-use std::{collections::HashMap, net::SocketAddr, sync::Arc};
+use std::{collections::HashMap, net::SocketAddr, sync::Arc, time::Duration};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{
@@ -20,6 +20,7 @@ const SERVER_INFO_HEADER: &str = "SERVER.INFO: ";
 const MAX_CONNECTIONS: usize = 100;
 const SERVER_PORT: u16 = 60_000;
 const SERVER_LISTEN_IP: &str = "127.0.0.1";
+const READ_TIMEOUT_MS: Duration = Duration::from_millis(1_000);
 
 enum Connection {
     Push {
@@ -289,6 +290,18 @@ enum ParseError {
 }
 
 macro_rules! or_close {
+    ($stream:expr, $sockaddr:expr, $method:ident, with_timeout) => {
+        match tokio::time::timeout(READ_TIMEOUT_MS, $stream.$method()).await {
+            Ok(res) => res.map_err(|_| ParseError::ConnClosed($sockaddr)),
+            Err(_) => Err(ParseError::ConnClosed($sockaddr)),
+        }
+    };
+    ($stream:expr, $sockaddr:expr, $method:ident, $arg:expr, with_timeout) => {
+        match tokio::time::timeout(READ_TIMEOUT_MS, $stream.$method($arg)).await {
+            Ok(res) => res.map_err(|_| ParseError::ConnClosed($sockaddr)),
+            Err(_) => Err(ParseError::ConnClosed($sockaddr)),
+        }
+    };
     ($stream:expr, $sockaddr:expr, $method:ident) => {
         $stream
             .$method()
@@ -321,7 +334,7 @@ async fn parse_messages(
         match state {
             State::ReadHeader => {
                 size = or_close!(stream, sockaddr, read_u32)?;
-                let msg_type = or_close!(stream, sockaddr, read_u8)?;
+                let msg_type = or_close!(stream, sockaddr, read_u8, with_timeout)?;
                 if size > MAX_MSG_LEN as u32 {
                     sender
                         .send(ConnMsg {
@@ -351,7 +364,8 @@ async fn parse_messages(
                     stream,
                     sockaddr,
                     read_exact,
-                    &mut buf[SerializedMessage::size_of_header()..]
+                    &mut buf[SerializedMessage::size_of_header()..],
+                    with_timeout
                 )?;
                 let msg = ParsedMsg::from_bytes(&buf[..size as usize])
                     .ok_or_else(|| ParseError::InvalidMsg)?;
