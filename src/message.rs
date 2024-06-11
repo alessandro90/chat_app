@@ -28,9 +28,9 @@ impl SerializedMessage {
     }
 
     #[must_use]
-    pub fn from_number(n: u32) -> Self {
+    pub fn from_user_count(n: u32) -> Self {
         let size = (Self::size_of_header() + std::mem::size_of_val(&n)) as u32;
-        let msg_type = MsgType::Num;
+        let msg_type = MsgType::UserCount;
         Self(serialize(size, msg_type, n.to_be_bytes().into_iter()))
     }
 
@@ -59,8 +59,7 @@ fn serialize(size: u32, msg_type: MsgType, payload: impl Iterator<Item = u8>) ->
 #[repr(u8)]
 pub enum MsgType {
     Text = 0,
-    // TODO: change this into UsrCount
-    Num = 1,
+    UserCount = 1,
 }
 
 impl MsgType {
@@ -75,7 +74,7 @@ impl TryInto<MsgType> for u8 {
     fn try_into(self) -> Result<MsgType, Self::Error> {
         match self {
             0 => Ok(MsgType::Text),
-            1 => Ok(MsgType::Num),
+            1 => Ok(MsgType::UserCount),
             _ => Err(()),
         }
     }
@@ -97,8 +96,7 @@ pub enum InfoKind {
 // NOTE: Should I create 2 message types, one for the server and one for the client?
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ParsedMsg {
-    // TODO: remove this and just use UsrCount(u32)
-    Num(u32),
+    UserCount(u32),
     Text(String),
     Command(Cmd),
     Info(InfoKind),
@@ -113,7 +111,7 @@ impl ParsedMsg {
             .try_into()
             .ok()?;
         match msg_type {
-            MsgType::Num => {
+            MsgType::UserCount => {
                 let mut it = bytes.iter().skip(SerializedMessage::size_of_header());
                 let a = *it.next()?;
                 let b = *it.next()?;
@@ -122,7 +120,7 @@ impl ParsedMsg {
                 if it.next().is_some() {
                     return None;
                 }
-                Some(Self::Num(u32::from_be_bytes([a, b, c, d])))
+                Some(Self::UserCount(u32::from_be_bytes([a, b, c, d])))
             }
             MsgType::Text => {
                 let text =
@@ -152,7 +150,7 @@ mod message_tests {
         let msg = SerializedMessage::from_string(&s);
         let parsed = ParsedMsg::from_bytes(msg.as_bytes()).unwrap();
         match parsed {
-            ParsedMsg::Num(_) => assert!(false),
+            ParsedMsg::UserCount(_) => assert!(false),
             ParsedMsg::Text(txt) => assert_eq!(txt, s),
             ParsedMsg::Command(_) => assert!(false),
             ParsedMsg::Info(_) => assert!(false),
@@ -162,10 +160,10 @@ mod message_tests {
     #[test]
     fn num_test() {
         let n = 11u32;
-        let msg = SerializedMessage::from_number(n);
+        let msg = SerializedMessage::from_user_count(n);
         let parsed = ParsedMsg::from_bytes(msg.as_bytes()).unwrap();
         match parsed {
-            ParsedMsg::Num(m) => assert_eq!(n, m),
+            ParsedMsg::UserCount(m) => assert_eq!(n, m),
             ParsedMsg::Text(_) => assert!(false),
             ParsedMsg::Command(_) => assert!(false),
             ParsedMsg::Info(_) => assert!(false),
@@ -177,7 +175,7 @@ mod message_tests {
         let msg = SerializedMessage::from_string("/count");
         let parsed = ParsedMsg::from_bytes(msg.as_bytes()).unwrap();
         match parsed {
-            ParsedMsg::Num(_) => assert!(false),
+            ParsedMsg::UserCount(_) => assert!(false),
             ParsedMsg::Text(_) => assert!(false),
             ParsedMsg::Command(cmd) => assert_eq!(cmd, Cmd::UserCount),
             ParsedMsg::Info(_) => assert!(false),

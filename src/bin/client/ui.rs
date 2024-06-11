@@ -24,6 +24,7 @@ const INPUT_NAME: &str = "input_view";
 const DIALOG_NAME: &str = "conn_err_dialog";
 const MAX_DURATION_DISCONNECTED: Duration = Duration::from_secs(5);
 const MAX_CHAT_LEN_CHARS: usize = 1_024 * 50;
+const INFO_PREFIX: &str = "INFO";
 
 type Runner = CursiveRunner<CursiveRunnable>;
 
@@ -228,9 +229,12 @@ impl Chat {
                 Ok(ParsedMsg::Command(_) | ParsedMsg::Info(_)) => {
                     panic!("Invalid message type from server {:#?}", msg)
                 }
-                Ok(ParsedMsg::Num(n)) => {
-                    self.text_view.append(n.to_string());
-                    self.text_view.append("\n\n");
+                Ok(ParsedMsg::UserCount(n)) => {
+                    self.text_view.append(format!(
+                        "{}.User-Count: {}\n\n",
+                        INFO_PREFIX,
+                        n.to_string()
+                    ));
                     let chars = self.text_view.get_content();
                     let chars = chars.source();
                     if chars.len() > MAX_CHAT_LEN_CHARS {

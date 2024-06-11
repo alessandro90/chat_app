@@ -79,7 +79,7 @@ impl Connections {
                     let mut lock_stream = stream.lock().await;
                     if let Ok(()) = lock_stream.writable().await {
                         lock_stream
-                            .write_all(SerializedMessage::from_number(user_count).as_bytes())
+                            .write_all(SerializedMessage::from_user_count(user_count).as_bytes())
                             .await
                             .expect("Cannot write to stream");
                     }
@@ -159,7 +159,7 @@ impl Connections {
     fn handle_message(&mut self, conn_msg: ConnMsg) {
         let ConnMsg { msg, sockaddr } = conn_msg;
         match msg {
-            ParsedMsg::Num(_) => (), // Clients cannot send numbers
+            ParsedMsg::UserCount(_) => (), // Clients cannot send numbers
             ParsedMsg::Command(cmd) => match cmd {
                 Cmd::UserCount => self.send_count_to_user(sockaddr),
             },
@@ -513,7 +513,7 @@ mod server_tests {
         let read_bytes = client.read_buf(&mut v).await.expect("Cannot read bytes");
         println!("Bytes received: {}", read_bytes);
         let msg = ParsedMsg::from_bytes(&v).expect("Fail to parse message");
-        let ParsedMsg::Num(n) = msg else {
+        let ParsedMsg::UserCount(n) = msg else {
             panic!("Invalid msg");
         };
         assert_eq!(1, n);
