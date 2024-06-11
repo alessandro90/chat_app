@@ -22,6 +22,10 @@ const SERVER_PORT: u16 = 60_000;
 const SERVER_LISTEN_IP: &str = "127.0.0.1";
 const READ_TIMEOUT_MS: Duration = Duration::from_millis(1_000);
 
+const HELP_STRING: &str = r"1. /help -> Get this message
+2. /count -> Current number of connectet users
+";
+
 enum Connection {
     Push {
         sockaddr: SocketAddr,
@@ -80,6 +84,21 @@ impl Connections {
                     if let Ok(()) = lock_stream.writable().await {
                         lock_stream
                             .write_all(SerializedMessage::from_user_count(user_count).as_bytes())
+                            .await
+                            .expect("Cannot write to stream");
+                    }
+                }
+            });
+        }
+    }
+    fn send_help_to_user(&self, sockaddr: SocketAddr) {
+        if let Some(stream) = self.entries.get(&sockaddr).map(Arc::downgrade) {
+            spawn(async move {
+                if let Some(stream) = stream.upgrade() {
+                    let mut lock_stream = stream.lock().await;
+                    if let Ok(()) = lock_stream.writable().await {
+                        lock_stream
+                            .write_all(SerializedMessage::from_help_string(HELP_STRING).as_bytes())
                             .await
                             .expect("Cannot write to stream");
                     }
@@ -159,9 +178,10 @@ impl Connections {
     fn handle_message(&mut self, conn_msg: ConnMsg) {
         let ConnMsg { msg, sockaddr } = conn_msg;
         match msg {
-            ParsedMsg::UserCount(_) => (), // Clients cannot send numbers
+            ParsedMsg::UserCount(_) | ParsedMsg::Help(_) => (), // Clients cannot send numbers
             ParsedMsg::Command(cmd) => match cmd {
                 Cmd::UserCount => self.send_count_to_user(sockaddr),
+                Cmd::Help => self.send_help_to_user(sockaddr),
             },
             ParsedMsg::Text(txt) => self.broadcast_msg(txt, sockaddr),
             ParsedMsg::Info(info_kind) => self.send_info_msg(sockaddr, info_kind),

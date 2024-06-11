@@ -222,6 +222,15 @@ impl Chat {
         }
     }
 
+    fn check_text_len(&mut self) {
+        let chars = self.text_view.get_content();
+        let chars = chars.source();
+        if chars.len() > MAX_CHAT_LEN_CHARS {
+            self.text_view
+                .set_content(chars[chars.len() / 2..].to_string());
+        }
+    }
+
     #[must_use]
     fn check_messages(&mut self) -> Option<MessageAction> {
         if let Some(msg) = self.reader.try_read_msg() {
@@ -235,17 +244,20 @@ impl Chat {
                         INFO_PREFIX,
                         n.to_string()
                     ));
-                    let chars = self.text_view.get_content();
-                    let chars = chars.source();
-                    if chars.len() > MAX_CHAT_LEN_CHARS {
-                        self.text_view
-                            .set_content(chars[chars.len() / 2..].to_string());
-                    }
+                    self.check_text_len();
+                    Some(MessageAction::Refresh)
+                }
+                Ok(ParsedMsg::Help(text)) => {
+                    self.text_view
+                        .append(format!("{}.Help:\n{}\n\n", INFO_PREFIX, text));
+                    self.text_view.append("\n\n");
+                    self.check_text_len();
                     Some(MessageAction::Refresh)
                 }
                 Ok(ParsedMsg::Text(text)) => {
                     self.text_view.append(text);
                     self.text_view.append("\n\n");
+                    self.check_text_len();
                     Some(MessageAction::Refresh)
                 }
                 Err(_) => Some(MessageAction::LostConnection),

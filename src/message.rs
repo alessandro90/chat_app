@@ -17,14 +17,23 @@ impl SerializedMessage {
     }
 
     #[must_use]
-    pub fn from_string(payload: &str) -> Self {
+    pub fn from_string_generic(payload: &str, msg_type: MsgType) -> Self {
         let size = (Self::size_of_header() + payload.len()) as u32;
-        let msg_type = MsgType::Text;
         Self(serialize(
             size,
             msg_type,
             payload.as_bytes().into_iter().cloned(),
         ))
+    }
+
+    #[must_use]
+    pub fn from_string(payload: &str) -> Self {
+        Self::from_string_generic(payload, MsgType::Text)
+    }
+
+    #[must_use]
+    pub fn from_help_string(payload: &str) -> Self {
+        Self::from_string_generic(payload, MsgType::Help)
     }
 
     #[must_use]
@@ -60,6 +69,7 @@ fn serialize(size: u32, msg_type: MsgType, payload: impl Iterator<Item = u8>) ->
 pub enum MsgType {
     Text = 0,
     UserCount = 1,
+    Help = 2,
 }
 
 impl MsgType {
@@ -75,6 +85,7 @@ impl TryInto<MsgType> for u8 {
         match self {
             0 => Ok(MsgType::Text),
             1 => Ok(MsgType::UserCount),
+            2 => Ok(MsgType::Help),
             _ => Err(()),
         }
     }
@@ -84,6 +95,7 @@ impl TryInto<MsgType> for u8 {
 #[repr(u8)]
 pub enum Cmd {
     UserCount,
+    Help,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -100,6 +112,7 @@ pub enum ParsedMsg {
     Text(String),
     Command(Cmd),
     Info(InfoKind),
+    Help(String),
 }
 
 impl ParsedMsg {
@@ -111,6 +124,11 @@ impl ParsedMsg {
             .try_into()
             .ok()?;
         match msg_type {
+            MsgType::Help => {
+                let text =
+                    String::from_utf8_lossy(bytes.get(SerializedMessage::size_of_header()..)?);
+                Some(Self::Help(text.to_string()))
+            }
             MsgType::UserCount => {
                 let mut it = bytes.iter().skip(SerializedMessage::size_of_header());
                 let a = *it.next()?;
@@ -128,6 +146,7 @@ impl ParsedMsg {
 
                 match text.as_ref().trim_end() {
                     "/count" => Some(Self::Command(Cmd::UserCount)),
+                    "/help" => Some(Self::Command(Cmd::Help)),
                     _ => Some(Self::Text(text.to_string())),
                 }
             }
@@ -154,6 +173,7 @@ mod message_tests {
             ParsedMsg::Text(txt) => assert_eq!(txt, s),
             ParsedMsg::Command(_) => assert!(false),
             ParsedMsg::Info(_) => assert!(false),
+            ParsedMsg::Help(_) => assert!(false),
         };
     }
 
@@ -167,6 +187,7 @@ mod message_tests {
             ParsedMsg::Text(_) => assert!(false),
             ParsedMsg::Command(_) => assert!(false),
             ParsedMsg::Info(_) => assert!(false),
+            ParsedMsg::Help(_) => assert!(false),
         };
     }
 
@@ -179,6 +200,7 @@ mod message_tests {
             ParsedMsg::Text(_) => assert!(false),
             ParsedMsg::Command(cmd) => assert_eq!(cmd, Cmd::UserCount),
             ParsedMsg::Info(_) => assert!(false),
+            ParsedMsg::Help(_) => assert!(false),
         };
     }
 }
