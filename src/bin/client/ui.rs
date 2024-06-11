@@ -21,21 +21,24 @@ use crate::connection::{Connection, Reader, Writer};
 
 const CHAT_NAME: &str = "chat_view";
 const INPUT_NAME: &str = "input_view";
-const DIALOG_NAME: &str = "ConnErr";
+const DIALOG_NAME: &str = "conn_err_dialog";
 const MAX_DURATION_DISCONNECTED: Duration = Duration::from_secs(5);
 
 type Runner = CursiveRunner<CursiveRunnable>;
 
 pub fn run() {
+    let mut args = env::args().skip(1);
+    if args.len() != 2 {
+        eprintln!("Provide server ip and port to connect");
+        return;
+    }
+    let ip = args.next().unwrap();
+    let port = args.next().as_ref().and_then(|p| p.parse().ok()).unwrap();
+
     let mut siv = cursive::default();
     siv.set_theme(Theme::terminal_default());
     let mut siv = siv.into_runner();
     siv.add_global_callback(Key::Esc, Cursive::quit);
-
-    let mut args = env::args().skip(1);
-    assert!(args.len() == 2);
-    let ip = args.next().unwrap();
-    let port = args.next().as_ref().and_then(|p| p.parse().ok()).unwrap();
 
     let mut app = App::new(&mut siv, ip, port);
 
@@ -44,7 +47,6 @@ pub fn run() {
         siv.step();
         app.run(&mut siv);
     }
-    siv.run();
 }
 
 struct App {
@@ -108,7 +110,7 @@ impl App {
             }
             State::NotConnected => {
                 if !(*self.retry_requested).borrow().to_owned()
-                    && Instant::now() - self.time_since_disconnection < MAX_DURATION_DISCONNECTED
+                    && self.time_since_disconnection.elapsed() < MAX_DURATION_DISCONNECTED
                 {
                     return;
                 }
@@ -138,7 +140,7 @@ impl App {
                     Err(_) => {
                         self.retries += 1;
                         let retries = self.retries;
-                        siv.call_on_name(DIALOG_NAME, |view: &mut Dialog| {
+                        siv.call_on_name(DIALOG_NAME, move |view: &mut Dialog| {
                             view.set_content(TextView::new(unable_to_connect_text(retries)));
                         });
                     }
@@ -192,7 +194,7 @@ fn unable_to_connect_text(retries: usize) -> String {
     format!("Unable to connect to server. Retry no. {}", retries)
 }
 
-#[derive(PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 enum State {
     NotConnected,
     Connected,
@@ -269,10 +271,15 @@ struct Input {
 impl Input {
     #[must_use]
     fn new(writer: Writer, text: Option<String>) -> Self {
-        Self {
-            text_area: TextArea::new().content(text.unwrap_or("".to_string())),
-            writer,
-        }
+        let text_area = match text {
+            Some(s) => {
+                let mut text_area = TextArea::new().content(s.to_owned());
+                text_area.set_cursor(s.len());
+                text_area
+            }
+            None => TextArea::new().content(""),
+        };
+        Self { text_area, writer }
     }
 }
 

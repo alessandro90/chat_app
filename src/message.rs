@@ -59,6 +59,7 @@ fn serialize(size: u32, msg_type: MsgType, payload: impl Iterator<Item = u8>) ->
 #[repr(u8)]
 pub enum MsgType {
     Text = 0,
+    // TODO: change this into UsrCount
     Num = 1,
 }
 
@@ -96,6 +97,7 @@ pub enum InfoKind {
 // NOTE: Should I create 2 message types, one for the server and one for the client?
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ParsedMsg {
+    // TODO: remove this and just use UsrCount(u32)
     Num(u32),
     Text(String),
     Command(Cmd),
