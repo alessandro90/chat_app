@@ -1,5 +1,10 @@
 use async_chat::message::{Cmd, InfoKind, ParsedMsg, SerializedMessage, MAX_MSG_LEN};
-use std::{collections::HashMap, net::SocketAddr, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    net::SocketAddr,
+    sync::{Arc, Weak},
+    time::Duration,
+};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{
@@ -22,9 +27,9 @@ const SERVER_PORT: u16 = 60_000;
 const SERVER_LISTEN_IP: &str = "0.0.0.0";
 const READ_TIMEOUT_MS: Duration = Duration::from_millis(1_000);
 
-const HELP_STRING: &str = r"1. /help -> Get this message
-2. /count -> Current number of connectet users
-";
+const HELP_STRING: &str = //
+    r"1. /help -> Get this message
+    2. /count -> Current number of connectet users";
 
 enum Connection {
     Push {
@@ -34,17 +39,70 @@ enum Connection {
     Pop(SocketAddr),
 }
 
-struct Connections {
-    // TODO: Encapsulate Arc<Mutex<OwnedWriteHalf>> in own struct
-    entries: HashMap<SocketAddr, Arc<Mutex<OwnedWriteHalf>>>,
+struct Entry {
+    writer_stream: Arc<Mutex<OwnedWriteHalf>>,
 }
 
-impl Default for Connections {
-    fn default() -> Self {
+impl Entry {
+    fn new(stream: OwnedWriteHalf) -> Self {
         Self {
-            entries: HashMap::new(),
+            writer_stream: Arc::new(Mutex::new(stream)),
         }
     }
+
+    async fn close(&mut self) {
+        let mut stream = self.writer_stream.lock().await;
+        if let Err(e) = stream.shutdown().await {
+            println!("Cannot shutdown stream: {}", e);
+        }
+    }
+
+    fn get_weak_stream(&self) -> WeakEntry {
+        WeakEntry {
+            stream: Arc::downgrade(&self.writer_stream),
+        }
+    }
+
+    async fn write_all<F>(&self, f: F)
+    where
+        F: FnOnce() -> SerializedMessage,
+    {
+        write_all(&self.writer_stream, f).await;
+    }
+}
+
+struct WeakEntry {
+    stream: Weak<Mutex<OwnedWriteHalf>>,
+}
+
+impl WeakEntry {
+    async fn write_all<F>(&self, f: F)
+    where
+        F: FnOnce() -> SerializedMessage,
+    {
+        if let Some(stream) = self.stream.upgrade() {
+            write_all(&stream, f).await;
+        }
+    }
+}
+
+async fn write_all<F>(stream: &Mutex<OwnedWriteHalf>, f: F)
+where
+    F: FnOnce() -> SerializedMessage,
+{
+    let mut lock_stream = stream.lock().await;
+    if let Ok(()) = lock_stream.writable().await {
+        lock_stream
+            .write_all(f().as_bytes())
+            .await
+            .expect("Cannot write to stream");
+    }
+}
+
+#[derive(Default)]
+struct Connections {
+    // TODO: Encapsulate Arc<Mutex<OwnedWriteHalf>> in own struct
+    entries: HashMap<SocketAddr, Entry>,
 }
 
 impl Connections {
@@ -55,9 +113,7 @@ impl Connections {
                 stream_writer,
             } => {
                 println!("added connection: {}", sockaddr);
-                let _ = self
-                    .entries
-                    .insert(sockaddr, Arc::new(Mutex::new(stream_writer)));
+                let _ = self.entries.insert(sockaddr, Entry::new(stream_writer));
                 if self.entries.len() >= MAX_CONNECTIONS {
                     self.send_info_msg(sockaddr, InfoKind::ServerFull);
                 }
@@ -65,70 +121,49 @@ impl Connections {
             Connection::Pop(sockaddr) => {
                 println!("removed connection: {}", sockaddr);
                 let stream = self.entries.remove(&sockaddr);
-                if let Some(stream) = stream {
-                    let mut stream = stream.lock().await;
-                    if let Err(e) = stream.shutdown().await {
-                        println!("Cannot shutdown stream: {}", e);
-                    }
+                if let Some(mut stream) = stream {
+                    stream.close().await;
                 }
             }
         };
     }
 
     fn send_count_to_user(&self, sockaddr: SocketAddr) {
-        if let Some(stream) = self.entries.get(&sockaddr).map(Arc::downgrade) {
+        if let Some(entry) = self.entries.get(&sockaddr).map(Entry::get_weak_stream) {
             let user_count = self.entries.len() as u32;
             spawn(async move {
-                if let Some(stream) = stream.upgrade() {
-                    let mut lock_stream = stream.lock().await;
-                    if let Ok(()) = lock_stream.writable().await {
-                        lock_stream
-                            .write_all(SerializedMessage::from_user_count(user_count).as_bytes())
-                            .await
-                            .expect("Cannot write to stream");
-                    }
-                }
+                entry
+                    .write_all(|| SerializedMessage::from_user_count(user_count))
+                    .await;
             });
         }
     }
+
     fn send_help_to_user(&self, sockaddr: SocketAddr) {
-        if let Some(stream) = self.entries.get(&sockaddr).map(Arc::downgrade) {
+        if let Some(entry) = self.entries.get(&sockaddr).map(Entry::get_weak_stream) {
             spawn(async move {
-                if let Some(stream) = stream.upgrade() {
-                    let mut lock_stream = stream.lock().await;
-                    if let Ok(()) = lock_stream.writable().await {
-                        lock_stream
-                            .write_all(SerializedMessage::from_help_string(HELP_STRING).as_bytes())
-                            .await
-                            .expect("Cannot write to stream");
-                    }
-                }
+                entry
+                    .write_all(|| SerializedMessage::from_help_string(HELP_STRING))
+                    .await;
             });
         }
     }
 
     fn broadcast_msg(&self, txt: String, sockaddr: SocketAddr) {
-        for (key, stream) in self.entries.iter().map(|(k, v)| (k, Arc::downgrade(v))) {
+        for (key, entry) in self.entries.iter().map(|(k, v)| (k, v.get_weak_stream())) {
             let txt = txt.clone();
             let key = key.clone();
             spawn(async move {
-                if let Some(stream) = stream.upgrade() {
-                    let mut lock_stream = stream.lock().await;
-                    if let Ok(()) = lock_stream.writable().await {
+                entry
+                    .write_all(|| {
                         let prefix = if key == sockaddr {
                             "You".to_string()
                         } else {
                             sockaddr.to_string()
                         };
-                        lock_stream
-                            .write_all(
-                                SerializedMessage::from_string(&format!("{}: {}", prefix, txt))
-                                    .as_bytes(),
-                            )
-                            .await
-                            .expect("Cannot write to stream");
-                    }
-                }
+                        SerializedMessage::from_string(&format!("{}: {}", prefix, txt))
+                    })
+                    .await;
             });
         }
     }
@@ -136,39 +171,30 @@ impl Connections {
     fn send_info_msg(&mut self, sockaddr: SocketAddr, info_kind: InfoKind) {
         match info_kind {
             InfoKind::MessageTooLong => {
-                if let Some(stream) = self.entries.get(&sockaddr).map(Arc::downgrade) {
+                if let Some(entry) = self.entries.get(&sockaddr).map(Entry::get_weak_stream) {
                     spawn(async move {
-                        if let Some(stream) = stream.upgrade() {
-                            let mut lock_stream = stream.lock().await;
-                            if let Ok(()) = lock_stream.writable().await {
+                        entry.write_all(|| {
                                 let msg = format!(
-                                        "{}Your message is too long. Maximum allowed lenght in bytes is {}",
-                                        SERVER_INFO_HEADER,
-                                        MAX_MSG_LEN
-                                    );
-                                lock_stream
-                                    .write_all(SerializedMessage::from_string(&msg).as_bytes())
-                                    .await
-                                    .expect("Cannot write to stream");
-                            }
-                        }
+                                    "{}Your message is too long. Maximum allowed lenght in bytes is {}",
+                                    SERVER_INFO_HEADER, MAX_MSG_LEN
+                                );
+                                SerializedMessage::from_string(&msg)
+                            })
+                            .await;
                     });
                 }
             }
             InfoKind::ServerFull => {
-                if let Some(stream) = self.entries.remove(&sockaddr) {
+                if let Some(entry) = self.entries.remove(&sockaddr) {
                     spawn(async move {
-                        let mut stream = stream.lock().await;
-                        if let Ok(()) = stream.writable().await {
+                        entry.write_all(|| {
                             let msg = format!(
                                 "{}Server has reached max number of connections {}. Refusing the connection.",
-                                SERVER_INFO_HEADER, MAX_CONNECTIONS
+                                SERVER_INFO_HEADER,
+                                MAX_CONNECTIONS
                             );
-                            stream
-                                .write_all(SerializedMessage::from_string(&msg).as_bytes())
-                                .await
-                                .expect("Cannot write to stream");
-                        }
+                            SerializedMessage::from_string(&msg)
+                        }).await;
                     });
                 }
             }
@@ -178,7 +204,7 @@ impl Connections {
     fn handle_message(&mut self, conn_msg: ConnMsg) {
         let ConnMsg { msg, sockaddr } = conn_msg;
         match msg {
-            ParsedMsg::UserCount(_) | ParsedMsg::Help(_) => (), // Clients cannot send numbers
+            ParsedMsg::UserCount(_) | ParsedMsg::Help(_) => (), // Clients cannot send these
             ParsedMsg::Command(cmd) => match cmd {
                 Cmd::UserCount => self.send_count_to_user(sockaddr),
                 Cmd::Help => self.send_help_to_user(sockaddr),

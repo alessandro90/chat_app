@@ -140,7 +140,7 @@ impl App {
                         Self::chat_layer(siv, connection, chat_text, input_text);
                     }
                     Err(_) => {
-                        self.retries += 1;
+                        self.retries = self.retries.wrapping_add(1);
                         let retries = self.retries;
                         siv.call_on_name(DIALOG_NAME, move |view: &mut Dialog| {
                             view.set_content(TextView::new(unable_to_connect_text(retries)));
